@@ -162,7 +162,7 @@ def catalog_menu(product_id: int):
 def order_menu(order_id: int):
     markup = InlineKeyboardMarkup()
     markup.row(
-        InlineKeyboardButton("📦 Просмотреть", callback_data=f"view_order_{order_id}"),
+        InlineKeyboardButton("✏️ Редактировать", callback_data=f"edit_order_{order_id}"),
         InlineKeyboardButton("📤 Выгрузить в Excel", callback_data=f"export_order_{order_id}")
     )
     return markup
@@ -449,7 +449,7 @@ def process_order_barcode(message):
                 if product:
                     product_id, name, price = product
                     cursor.execute(
-                        "INSERT INTO order_items (order_id, product_id) VALUES (%s, %s)",
+                        "INSERT INTO order_items (order_id, product_id, quantity) VALUES (%s, %s, 1)",
                         (order_id, product_id)
                     )
                     conn.commit()
@@ -498,33 +498,29 @@ def list_orders(message):
         logger.error(f"Ошибка показа списка заявок: {e}")
         bot.send_message(message.chat.id, "❌ Ошибка загрузки списка заявок")
 
-@bot.callback_query_handler(func=lambda call: call.data.startswith(('view_order_', 'export_order_')))
+@bot.callback_query_handler(func=lambda call: call.data.startswith(('edit_order_', 'export_order_')))
 def handle_order_callback(call):
     try:
         action, order_id = call.data.split('_')
         order_id = int(order_id)
         
-        if action == 'view':
-            with psycopg2.connect(DB_URL, sslmode="require") as conn:
-                with conn.cursor() as cursor:
-                    cursor.execute(
-                        "SELECT p.name, p.price, oi.quantity FROM order_items oi "
-                        "JOIN products p ON oi.product_id = p.id "
-                        "WHERE oi.order_id = %s",
-                        (order_id,)
-                    )
-                    items = cursor.fetchall()
-            
-            if not items:
-                bot.send_message(call.message.chat.id, "🛒 Заявка пуста.")
-                return
-            
-            response_text = "📦 Товары в заявке:\n"
-            for item in items:
-                name, price, quantity = item
-                response_text += f"📦 {name} - {price} руб. x {quantity}\n"
-            
-            bot.send_message(call.message.chat.id, response_text)
+        if action == 'edit':
+            user_states[call.message.chat.id] = {
+                'step': 'edit_order',
+                'order_id': order_id
+            }
+            bot.send_message(
+                call.message.chat.id,
+                "📝 Выберите действие:\n"
+                "1. 📦 Просмотреть товары\n"
+                "2. ➕ Добавить товар\n"
+                "3. ❌ Удалить товар",
+                reply_markup=ReplyKeyboardMarkup(resize_keyboard=True)
+                    .add(KeyboardButton("📦 Просмотреть товары"))
+                    .add(KeyboardButton("➕ Добавить товар"))
+                    .add(KeyboardButton("❌ Удалить товар"))
+                    .add(KeyboardButton("🔙 Назад"))
+            )
             
         elif action == 'export':
             with psycopg2.connect(DB_URL, sslmode="require") as conn:
@@ -565,6 +561,151 @@ def handle_order_callback(call):
     except Exception as e:
         logger.error(f"Ошибка обработки callback: {e}")
         bot.send_message(call.message.chat.id, "❌ Произошла ошибка при обработке запроса")
+
+@bot.message_handler(func=lambda m: user_states.get(m.chat.id, {}).get('step') == 'edit_order')
+def handle_edit_order(message):
+    try:
+        order_id = user_states[message.chat.id]['order_id']
+        
+        if message.text == "📦 Просмотреть товары":
+            with psycopg2.connect(DB_URL, sslmode="require") as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute(
+                        "SELECT p.name, p.price, oi.quantity FROM order_items oi "
+                        "JOIN products p ON oi.product_id = p.id "
+                        "WHERE oi.order_id = %s",
+                        (order_id,)
+                    )
+                    items = cursor.fetchall()
+            
+            if not items:
+                bot.send_message(message.chat.id, "🛒 Заявка пуста.")
+                return
+            
+            response_text = "📦 Товары в заявке:\n"
+            for item in items:
+                name, price, quantity = item
+                response_text += f"📦 {name} - {price} руб. x {quantity}\n"
+            
+            bot.send_message(message.chat.id, response_text)
+            
+        elif message.text == "➕ Добавить товар":
+            user_states[message.chat.id] = {
+                'step': 'add_product_to_order',
+                'order_id': order_id
+            }
+            bot.send_message(
+                message.chat.id,
+                "📦 Введите последние 4 цифры штрихкода товара:"
+            )
+            
+        elif message.text == "❌ Удалить товар":
+            user_states[message.chat.id] = {
+                'step': 'remove_product_from_order',
+                'order_id': order_id
+            }
+            bot.send_message(
+                message.chat.id,
+                "📦 Введите последние 4 цифры штрихкода товара для удаления:"
+            )
+            
+        elif message.text == "🔙 Назад":
+            user_states.pop(message.chat.id, None)
+            bot.send_message(
+                message.chat.id,
+                "🔙 Возврат в главное меню.",
+                reply_markup=main_menu()
+            )
+            
+    except Exception as e:
+        logger.error(f"Ошибка редактирования заявки: {e}")
+        bot.send_message(message.chat.id, "❌ Ошибка при редактировании заявки")
+
+@bot.message_handler(func=lambda m: user_states.get(m.chat.id, {}).get('step') == 'add_product_to_order')
+def handle_add_product_to_order(message):
+    try:
+        last_four_digits = message.text.strip()
+        if not last_four_digits.isdigit() or len(last_four_digits) != 4:
+            raise ValueError("Введите ровно 4 цифры")
+        
+        order_id = user_states[message.chat.id]['order_id']
+        
+        with psycopg2.connect(DB_URL, sslmode="require") as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    "SELECT id, name, price FROM products WHERE telegram_id = %s AND barcode LIKE %s",
+                    (message.chat.id, f"%{last_four_digits}")
+                )
+                product = cursor.fetchone()
+                
+                if product:
+                    product_id, name, price = product
+                    cursor.execute(
+                        "INSERT INTO order_items (order_id, product_id, quantity) VALUES (%s, %s, 1)",
+                        (order_id, product_id)
+                    )
+                    conn.commit()
+                    bot.send_message(
+                        message.chat.id,
+                        f"✅ Товар '{name}' добавлен в заявку!",
+                        reply_markup=main_menu()
+                    )
+                else:
+                    bot.send_message(
+                        message.chat.id,
+                        "❌ Товар не найден. Попробуйте еще раз.",
+                        reply_markup=main_menu()
+                    )
+        
+    except Exception as e:
+        logger.error(f"Ошибка добавления товара в заявку: {e}")
+        bot.send_message(message.chat.id, "❌ Ошибка: введите ровно 4 цифры")
+    finally:
+        user_states.pop(message.chat.id, None)
+
+@bot.message_handler(func=lambda m: user_states.get(m.chat.id, {}).get('step') == 'remove_product_from_order')
+def handle_remove_product_from_order(message):
+    try:
+        last_four_digits = message.text.strip()
+        if not last_four_digits.isdigit() or len(last_four_digits) != 4:
+            raise ValueError("Введите ровно 4 цифры")
+        
+        order_id = user_states[message.chat.id]['order_id']
+        
+        with psycopg2.connect(DB_URL, sslmode="require") as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    "SELECT p.id, p.name FROM products p "
+                    "JOIN order_items oi ON p.id = oi.product_id "
+                    "WHERE oi.order_id = %s AND p.barcode LIKE %s",
+                    (order_id, f"%{last_four_digits}")
+                )
+                product = cursor.fetchone()
+                
+                if product:
+                    product_id, name = product
+                    cursor.execute(
+                        "DELETE FROM order_items WHERE order_id = %s AND product_id = %s",
+                        (order_id, product_id)
+                    )
+                    conn.commit()
+                    bot.send_message(
+                        message.chat.id,
+                        f"✅ Товар '{name}' удален из заявки!",
+                        reply_markup=main_menu()
+                    )
+                else:
+                    bot.send_message(
+                        message.chat.id,
+                        "❌ Товар не найден в заявке. Попробуйте еще раз.",
+                        reply_markup=main_menu()
+                    )
+        
+    except Exception as e:
+        logger.error(f"Ошибка удаления товара из заявки: {e}")
+        bot.send_message(message.chat.id, "❌ Ошибка: введите ровно 4 цифры")
+    finally:
+        user_states.pop(message.chat.id, None)
 
 if __name__ == "__main__":
     # Запуск Flask сервера
