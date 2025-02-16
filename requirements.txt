@@ -1,10 +1,6 @@
-pyTelegramBotAPI
-python-telegram-bot==20.0
-asyncpg
-python-telegram-bot
-pyzbar==0.1.9
-Pillow==9.5.0
+pyzbar==0.1.10
+Pillow==10.3.0
 telebot==0.0.5
-psycopg2-binary==2.9.6
-openpyxl==3.1.2
-python-dotenv==0.19.2
+psycopg2-binary==2.9.9
+openpyxl==3.1.4
+python-dotenv==1.0.1
