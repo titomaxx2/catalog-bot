@@ -349,7 +349,7 @@ def process_barcode_scan(message):
             'https://api.ocr.space/parse/image',
             files={'image': ('barcode.jpg', compressed_image, 'image/jpeg')},
             data={'apikey': OCR_API_KEY, 'OCREngine': 2},
-            timeout=20
+            timeout=60
         )
         
         # Обработка ответа
