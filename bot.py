@@ -52,6 +52,7 @@ with conn:
 authorized_users = {}
 
 def is_authorized(user_id):
+    logging.info(f"Проверка авторизации для пользователя: {user_id}")
     return user_id in authorized_users
 
 def authorize(user_id, username, password):
@@ -90,6 +91,7 @@ def main_menu():
 # Добавление товаров
 @bot.message_handler(func=lambda message: message.text == "Добавить товар")
 def add_product(message):
+    logging.info(f"Попытка добавить товар от пользователя: {message.chat.id}")
     if not is_authorized(message.chat.id):
         bot.send_message(message.chat.id, "⛔ Вы не авторизованы!")
         return
