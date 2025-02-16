@@ -1,5 +1,4 @@
 import os
-import asyncio
 import logging
 import psycopg2
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -96,8 +95,5 @@ async def main() -> None:
 
 # Запуск бота
 if __name__ == "__main__":
-    try:
-        loop = asyncio.get_event_loop()
-        loop.run_until_complete(main())
-    except RuntimeError:
-        asyncio.run(main())
+    import asyncio
+    asyncio.run(main())
