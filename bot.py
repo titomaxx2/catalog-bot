@@ -53,14 +53,13 @@ authorized_users = {}
 
 def is_authorized(user_id):
     logging.info(f"Проверка авторизации для пользователя: {user_id}")
-    logging.info(f"Текущие авторизованные пользователи: {authorized_users}")
     return user_id in authorized_users
 
 def authorize(user_id, username, password):
     with conn.cursor() as cursor:
-        cursor.execute("SELECT id FROM supervisors WHERE username = %s AND password = %s", (username, password))
+        cursor.execute("SELECT id, password FROM supervisors WHERE username = %s", (username,))
         supervisor = cursor.fetchone()
-        if supervisor:
+        if supervisor and supervisor[1] == password:  # Сравниваем введённый пароль с тем, что в БД
             logging.info(f"Авторизация успешна для пользователя: {username} (ID: {supervisor[0]})")
             authorized_users[user_id] = supervisor[0]
             # Обновляем telegram_id у супервайзера
