@@ -387,17 +387,19 @@ def process_barcode_scan(message):
                 
                 # Обработка ответа
                 if response.status_code != 200:
+                    logger.error(f"HTTP Error {response.status_code}: {response.text}")
                     raise Exception(f"HTTP Error {response.status_code}")
                 
                 result = response.json()
-                logger.debug(f"Ответ OCR: {json.dumps(result, indent=2)}")
+                logger.info(f"Ответ OCR: {json.dumps(result, indent=2)}")  # Логируем полный ответ
 
                 # Проверка структуры ответа
                 if not result.get('ParsedResults'):
+                    logger.error("Некорректный ответ от OCR API: отсутствует ParsedResults")
                     raise Exception("Некорректный ответ от OCR API")
                 
                 parsed_text = result['ParsedResults'][0].get('ParsedText', '')
-                logger.debug(f"Распознанный текст: {parsed_text}")
+                logger.info(f"Распознанный текст: {parsed_text}")
 
                 # Поиск штрихкода
                 numbers = [word.strip() for word in parsed_text.split() if word.strip().isdigit()]
