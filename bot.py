@@ -59,11 +59,14 @@ def authorize(user_id, username, password):
         cursor.execute("SELECT id FROM supervisors WHERE username = %s AND password = %s", (username, password))
         supervisor = cursor.fetchone()
         if supervisor:
+            logging.info(f"Авторизация успешна для пользователя: {username} (ID: {supervisor[0]})")
             authorized_users[user_id] = supervisor[0]
             # Обновляем telegram_id у супервайзера
             cursor.execute("UPDATE supervisors SET telegram_id = %s WHERE id = %s", (user_id, supervisor[0]))
             conn.commit()
             return True
+        else:
+            logging.warning(f"Ошибка авторизации для пользователя: {username} (Неверный логин или пароль)")
     return False
 
 @bot.message_handler(commands=['start'])
