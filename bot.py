@@ -96,4 +96,15 @@ async def main() -> None:
 # Запуск бота
 if __name__ == "__main__":
     import asyncio
-    asyncio.run(main())
+
+    # Убедимся, что цикл событий не запущен
+    try:
+        asyncio.run(main())
+    except RuntimeError as e:
+        if str(e) == "Event loop is closed":
+            # Если цикл событий уже закрыт, запускаем его вручную
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            loop.run_until_complete(main())
+        else:
+            raise e
