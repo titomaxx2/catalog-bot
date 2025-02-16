@@ -53,6 +53,7 @@ authorized_users = {}
 
 def is_authorized(user_id):
     logging.info(f"Проверка авторизации для пользователя: {user_id}")
+    logging.info(f"Текущие авторизованные пользователи: {authorized_users}")
     return user_id in authorized_users
 
 def authorize(user_id, username, password):
