@@ -26,7 +26,8 @@ with conn:
             id SERIAL PRIMARY KEY,
             telegram_id BIGINT UNIQUE,
             username TEXT UNIQUE,
-            password TEXT
+            password TEXT,
+            is_authorized BOOLEAN DEFAULT FALSE
         );
         """)
         cursor.execute("""
@@ -48,32 +49,32 @@ with conn:
         """)
         conn.commit()
 
-# Авторизованные пользователи
-authorized_users = {}
-
+# Функция для проверки авторизации
 def is_authorized(user_id):
-    logging.info(f"Проверка авторизации для пользователя: {user_id}")
-    return user_id in authorized_users
+    with conn.cursor() as cursor:
+        cursor.execute("SELECT id FROM supervisors WHERE telegram_id = %s AND is_authorized = TRUE", (user_id,))
+        return cursor.fetchone() is not None
 
+# Функция для авторизации
 def authorize(user_id, username, password):
     with conn.cursor() as cursor:
-        cursor.execute("SELECT id, password FROM supervisors WHERE username = %s", (username,))
+        cursor.execute("SELECT id FROM supervisors WHERE username = %s AND password = %s", (username, password))
         supervisor = cursor.fetchone()
-        if supervisor and supervisor[1] == password:  # Сравниваем введённый пароль с тем, что в БД
+        if supervisor:
             logging.info(f"Авторизация успешна для пользователя: {username} (ID: {supervisor[0]})")
-            authorized_users[user_id] = supervisor[0]
-            # Обновляем telegram_id у супервайзера
-            cursor.execute("UPDATE supervisors SET telegram_id = %s WHERE id = %s", (user_id, supervisor[0]))
+            cursor.execute("UPDATE supervisors SET telegram_id = %s, is_authorized = TRUE WHERE id = %s", (user_id, supervisor[0]))
             conn.commit()
             return True
         else:
             logging.warning(f"Ошибка авторизации для пользователя: {username} (Неверный логин или пароль)")
     return False
 
+# Команда /start
 @bot.message_handler(commands=['start'])
 def start_message(message):
     bot.send_message(message.chat.id, "Введите логин и пароль через пробел (пример: user pass)")
 
+# Обработка логина и пароля
 @bot.message_handler(func=lambda message: " " in message.text and message.text.count(" ") == 1)
 def login(message):
     username, password = message.text.split(" ", 1)
@@ -91,7 +92,6 @@ def main_menu():
 # Добавление товаров
 @bot.message_handler(func=lambda message: message.text == "Добавить товар")
 def add_product(message):
-    logging.info(f"Попытка добавить товар от пользователя: {message.chat.id}")
     if not is_authorized(message.chat.id):
         bot.send_message(message.chat.id, "⛔ Вы не авторизованы!")
         return
@@ -103,10 +103,12 @@ def process_product(message):
         barcode, name, price = message.text.split(",")
         price = float(price)
         with conn.cursor() as cursor:
+            cursor.execute("SELECT id FROM supervisors WHERE telegram_id = %s", (message.chat.id,))
+            supervisor_id = cursor.fetchone()[0]
             cursor.execute("""
             INSERT INTO products (supervisor_id, barcode, name, price) 
             VALUES (%s, %s, %s, %s)
-            """, (authorized_users[message.chat.id], barcode.strip(), name.strip(), price))
+            """, (supervisor_id, barcode.strip(), name.strip(), price))
             conn.commit()
         bot.send_message(message.chat.id, "✅ Товар добавлен!", reply_markup=main_menu())
     except Exception as e:
@@ -134,9 +136,11 @@ def save_order(message, shop_name):
             barcode, quantity = item.split(":")
             order_data.append({"barcode": barcode.strip(), "quantity": int(quantity)})
         with conn.cursor() as cursor:
+            cursor.execute("SELECT id FROM supervisors WHERE telegram_id = %s", (message.chat.id,))
+            supervisor_id = cursor.fetchone()[0]
             cursor.execute("""
             INSERT INTO orders (supervisor_id, shop_name, products) VALUES (%s, %s, %s)
-            """, (authorized_users[message.chat.id], shop_name, json.dumps(order_data)))
+            """, (supervisor_id, shop_name, json.dumps(order_data)))
             conn.commit()
         bot.send_message(message.chat.id, "✅ Заказ сохранен!", reply_markup=main_menu())
     except Exception as e:
