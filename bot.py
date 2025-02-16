@@ -1,161 +1,117 @@
 import os
-import asyncio
-import logging
 import psycopg2
-from datetime import datetime, timedelta
+import asyncio
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CallbackQueryHandler, CommandHandler, MessageHandler, filters
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
 
-# Логирование
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
-# Токен бота
+# Загрузка переменных окружения
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+DB_URL = os.getenv("DATABASE_URL")
+ADMIN_ID = os.getenv("ADMIN_ID")
+
+if not ADMIN_ID:
+    raise ValueError("Переменная окружения ADMIN_ID не задана!")
+
+ADMIN_ID = int(ADMIN_ID)
 
 # Подключение к базе данных Supabase (PostgreSQL)
-DB_URL = os.getenv("DATABASE_URL")
 conn = psycopg2.connect(DB_URL)
 cur = conn.cursor()
 
-# Глобальные переменные
-active_users = {}
-admin_id = int(os.getenv("ADMIN_ID"))  # ID админа
-
-# === ФУНКЦИИ РАБОТЫ С БД ===
-
-# Проверка, является ли пользователь супервайзером
-def is_supervisor(user_id):
-    cur.execute("SELECT COUNT(*) FROM supervisors WHERE user_id = %s", (user_id,))
-    return cur.fetchone()[0] > 0
+# Функция старта
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.message.from_user.id
+    if user_id == ADMIN_ID:
+        keyboard = [
+            [InlineKeyboardButton("Добавить супервайзера", callback_data="add_supervisor")],
+            [InlineKeyboardButton("Удалить супервайзера", callback_data="remove_supervisor")],
+            [InlineKeyboardButton("Показать супервайзеров", callback_data="list_supervisors")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await update.message.reply_text("Вы в режиме админа.", reply_markup=reply_markup)
+    else:
+        await update.message.reply_text("Привет! Используйте /catalog для работы.")
 
 # Добавление супервайзера
-def add_supervisor(user_id):
-    cur.execute("INSERT INTO supervisors (user_id) VALUES (%s) ON CONFLICT DO NOTHING", (user_id,))
-    conn.commit()
+async def add_supervisor(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.message.reply_text("Введите Telegram ID супервайзера:")
+    context.user_data["adding_supervisor"] = True
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.message.from_user.id
+    message_text = update.message.text
+
+    if context.user_data.get("adding_supervisor"):
+        try:
+            supervisor_id = int(message_text)
+            cur.execute("INSERT INTO supervisors (id) VALUES (%s) ON CONFLICT DO NOTHING;", (supervisor_id,))
+            conn.commit()
+            await update.message.reply_text(f"Супервайзер {supervisor_id} добавлен.")
+        except ValueError:
+            await update.message.reply_text("Ошибка: введите числовой ID.")
+        context.user_data["adding_supervisor"] = False
 
 # Удаление супервайзера
-def remove_supervisor(user_id):
-    cur.execute("DELETE FROM supervisors WHERE user_id = %s", (user_id,))
-    conn.commit()
-
-# Получение каталога товаров
-def get_catalog():
-    cur.execute("SELECT id, name, price FROM catalog")
-    products = cur.fetchall()
-    return products
-
-# Добавление заказа
-def add_order(user_id, items):
-    cur.execute("INSERT INTO orders (user_id, items, created_at) VALUES (%s, %s, %s)", (user_id, str(items), datetime.now()))
-    conn.commit()
-
-# Получение всех заказов
-def get_orders():
-    cur.execute("SELECT id, user_id, items FROM orders ORDER BY created_at DESC")
-    return cur.fetchall()
-
-# === ОБРАБОТЧИКИ ===
-
-# Главное меню
-def get_main_menu():
-    keyboard = [
-        [InlineKeyboardButton("📦 Каталог", callback_data="catalog")],
-        [InlineKeyboardButton("🛒 Корзина", callback_data="cart")],
-        [InlineKeyboardButton("📜 Оформить заказ", callback_data="order")],
-    ]
-    return InlineKeyboardMarkup(keyboard)
-
-# Команда /start
-async def start(update: Update, context):
-    user_id = update.message.chat_id
-    active_users[user_id] = datetime.now() + timedelta(minutes=5)  # Таймер активности
-    text = "Привет! Я бот для заказов. Выбери действие:"
-    if user_id == admin_id:
-        text += "\n🔹 Ты админ, доступно: /add_supervisor, /del_supervisor, /orders"
-    elif is_supervisor(user_id):
-        text += "\n🔹 Ты супервайзер, можешь управлять заказами."
-    await update.message.reply_text(text, reply_markup=get_main_menu())
-
-# Обработчик кнопок
-async def button_handler(update: Update, context):
+async def remove_supervisor(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    user_id = query.from_user.id
+    await query.message.reply_text("Введите Telegram ID супервайзера для удаления:")
+    context.user_data["removing_supervisor"] = True
+
+async def handle_remove_supervisor(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.message.from_user.id
+    message_text = update.message.text
+
+    if context.user_data.get("removing_supervisor"):
+        try:
+            supervisor_id = int(message_text)
+            cur.execute("DELETE FROM supervisors WHERE id = %s;", (supervisor_id,))
+            conn.commit()
+            await update.message.reply_text(f"Супервайзер {supervisor_id} удалён.")
+        except ValueError:
+            await update.message.reply_text("Ошибка: введите числовой ID.")
+        context.user_data["removing_supervisor"] = False
+
+# Показ супервайзеров
+async def list_supervisors(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    cur.execute("SELECT id FROM supervisors;")
+    supervisors = cur.fetchall()
+    if supervisors:
+        supervisors_list = "\n".join([str(s[0]) for s in supervisors])
+        await update.callback_query.message.reply_text(f"Супервайзеры:\n{supervisors_list}")
+    else:
+        await update.callback_query.message.reply_text("Супервайзеров пока нет.")
+
+# Обработчик команд супервайзера
+async def catalog(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.message.from_user.id
+    cur.execute("SELECT id FROM supervisors WHERE id = %s;", (user_id,))
+    if cur.fetchone():
+        await update.message.reply_text("Каталог: (будет реализован)")
+    else:
+        await update.message.reply_text("Вы не являетесь супервайзером!")
+
+# Callback обработчик
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if query.data == "add_supervisor":
+        await add_supervisor(update, context)
+    elif query.data == "remove_supervisor":
+        await remove_supervisor(update, context)
+    elif query.data == "list_supervisors":
+        await list_supervisors(update, context)
     await query.answer()
 
-    if query.data == "catalog":
-        products = get_catalog()
-        text = "📦 Каталог товаров:\n" + "\n".join([f"{p[0]}. {p[1]} - {p[2]}₸" for p in products])
-        await query.edit_message_text(text, reply_markup=get_main_menu())
-
-    elif query.data == "cart":
-        await query.edit_message_text("🛒 Ваша корзина пуста.", reply_markup=get_main_menu())
-
-    elif query.data == "order":
-        await query.edit_message_text("📜 Для оформления заказа напишите ваш адрес.", reply_markup=get_main_menu())
-
-# === АДМИН-КОМАНДЫ ===
-
-# Добавить супервайзера
-async def add_supervisor_cmd(update: Update, context):
-    if update.message.chat_id != admin_id:
-        return
-    if len(context.args) == 0:
-        await update.message.reply_text("Используй: /add_supervisor [user_id]")
-        return
-    user_id = int(context.args[0])
-    add_supervisor(user_id)
-    await update.message.reply_text(f"✅ Супервайзер {user_id} добавлен.")
-
-# Удалить супервайзера
-async def del_supervisor_cmd(update: Update, context):
-    if update.message.chat_id != admin_id:
-        return
-    if len(context.args) == 0:
-        await update.message.reply_text("Используй: /del_supervisor [user_id]")
-        return
-    user_id = int(context.args[0])
-    remove_supervisor(user_id)
-    await update.message.reply_text(f"✅ Супервайзер {user_id} удалён.")
-
-# Показать заказы
-async def show_orders(update: Update, context):
-    if update.message.chat_id != admin_id and not is_supervisor(update.message.chat_id):
-        return
-    orders = get_orders()
-    if not orders:
-        await update.message.reply_text("❌ Заказов нет.")
-        return
-    text = "\n".join([f"📦 Заказ {o[0]} от {o[1]}: {o[2]}" for o in orders])
-    await update.message.reply_text(f"📜 Все заказы:\n{text}")
-
-# Проверка активности пользователей
-async def check_inactive_users():
-    while True:
-        now = datetime.now()
-        to_remove = [user for user, timeout in active_users.items() if now > timeout]
-        for user in to_remove:
-            del active_users[user]
-            logger.info(f"Пользователь {user} отключен из-за неактивности.")
-        await asyncio.sleep(60)
-
-# === ГЛАВНАЯ ФУНКЦИЯ ===
+# Главная функция
 async def main():
     app = Application.builder().token(TOKEN).build()
 
-    # Обработчики команд и кнопок
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("catalog", catalog))
     app.add_handler(CallbackQueryHandler(button_handler))
-    app.add_handler(CommandHandler("add_supervisor", add_supervisor_cmd))
-    app.add_handler(CommandHandler("del_supervisor", del_supervisor_cmd))
-    app.add_handler(CommandHandler("orders", show_orders))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    # Запуск проверки неактивных пользователей
-    asyncio.create_task(check_inactive_users())
-
-    # Запуск бота
     await app.run_polling()
 
-# Запуск
 if __name__ == "__main__":
     asyncio.run(main())
