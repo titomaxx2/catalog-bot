@@ -1,4 +1,4 @@
-python-telegram-bot==20.6
+pyTelegramBotAPI==4.14.1  # Правильное название пакета для telebot
 psycopg2-binary==2.9.9
 openpyxl==3.1.4
 requests==2.31.0
