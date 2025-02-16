@@ -1,79 +1,142 @@
+import os
+import logging
+import json
 import telebot
 import psycopg2
-import logging
-from telebot import types
+from telebot.types import ReplyKeyboardMarkup, KeyboardButton
 
 # Логирование
 logging.basicConfig(level=logging.INFO)
 
-# Телеграм токен
-TOKEN = "ВАШ_ТОКЕН"
+# Получаем переменные окружения
+TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+DB_URL = os.getenv("DATABASE_URL")
+
+if not TOKEN or not DB_URL:
+    raise ValueError("Отсутствуют необходимые переменные окружения")
+
 bot = telebot.TeleBot(TOKEN)
+conn = psycopg2.connect(DB_URL, sslmode="require")
 
-# Подключение к базе данных
-DB_CONFIG = {
-    'dbname': 'postgres',
-    'user': 'postgres',
-    'password': 'ВАШ_ПАРОЛЬ',
-    'host': 'db.ваш_supabase_host.com',
-    'port': '5432'
-}
+# Инициализация БД
+with conn:
+    with conn.cursor() as cursor:
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS supervisors (
+            id SERIAL PRIMARY KEY,
+            telegram_id BIGINT UNIQUE,
+            username TEXT UNIQUE,
+            password TEXT
+        );
+        """)
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS products (
+            id SERIAL PRIMARY KEY,
+            supervisor_id INT REFERENCES supervisors(id) ON DELETE CASCADE,
+            barcode TEXT,
+            name TEXT,
+            price FLOAT
+        );
+        """)
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS orders (
+            id SERIAL PRIMARY KEY,
+            supervisor_id INT REFERENCES supervisors(id) ON DELETE CASCADE,
+            shop_name TEXT,
+            products JSONB
+        );
+        """)
+        conn.commit()
 
-conn = psycopg2.connect(**DB_CONFIG)
-
-# Хранилище авторизованных пользователей
+# Авторизованные пользователи
 authorized_users = {}
 
-# Команда /start
+def is_authorized(user_id):
+    return user_id in authorized_users
+
+def authorize(user_id, username, password):
+    with conn.cursor() as cursor:
+        cursor.execute("SELECT id FROM supervisors WHERE username = %s AND password = %s", (username, password))
+        supervisor = cursor.fetchone()
+        if supervisor:
+            authorized_users[user_id] = supervisor[0]
+            # Обновляем telegram_id у супервайзера
+            cursor.execute("UPDATE supervisors SET telegram_id = %s WHERE id = %s", (user_id, supervisor[0]))
+            conn.commit()
+            return True
+    return False
+
 @bot.message_handler(commands=['start'])
-def start(message):
+def start_message(message):
     bot.send_message(message.chat.id, "Введите логин и пароль через пробел (пример: user pass)")
 
-# Авторизация пользователя
-@bot.message_handler(func=lambda message: ' ' in message.text)
-def authorize(message):
-    user_id = message.chat.id
+@bot.message_handler(func=lambda message: " " in message.text and message.text.count(" ") == 1)
+def login(message):
+    username, password = message.text.split(" ", 1)
+    if authorize(message.chat.id, username, password):
+        bot.send_message(message.chat.id, "✅ Вход выполнен!", reply_markup=main_menu())
+    else:
+        bot.send_message(message.chat.id, "❌ Неверный логин или пароль")
+
+# Главное меню
+def main_menu():
+    markup = ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=False)
+    markup.add(KeyboardButton("Добавить товар"), KeyboardButton("Создать заказ"))
+    return markup
+
+# Добавление товаров
+@bot.message_handler(func=lambda message: message.text == "Добавить товар")
+def add_product(message):
+    if not is_authorized(message.chat.id):
+        bot.send_message(message.chat.id, "⛔ Вы не авторизованы!")
+        return
+    bot.send_message(message.chat.id, "Введите штрихкод, название и цену через запятую (пример: 123456, Молоко, 200)")
+    bot.register_next_step_handler(message, process_product)
+
+def process_product(message):
     try:
-        username, password = message.text.split(" ", 1)
+        barcode, name, price = message.text.split(",")
+        price = float(price)
         with conn.cursor() as cursor:
-            cursor.execute("SELECT id FROM supervisors WHERE username = %s AND password = %s", (username, password))
-            supervisor = cursor.fetchone()
-
-            if supervisor:
-                authorized_users[user_id] = username
-                bot.send_message(user_id, "✅ Вход выполнен!")
-            else:
-                bot.send_message(user_id, "❌ Неверный логин или пароль")
-    except Exception as e:
-        logging.error(f"Ошибка авторизации: {e}")
-        bot.send_message(user_id, "❌ Ошибка входа. Попробуйте снова.")
-
-# Добавить товар
-@bot.message_handler(func=lambda message: message.text.lower() == "добавить товар")
-def handle_add_product(message):
-    user_id = message.chat.id
-    if user_id in authorized_users:
-        bot.send_message(user_id, "Введите название товара:")
-        bot.register_next_step_handler(message, save_product_name)
-    else:
-        bot.send_message(user_id, "❌ Неверный логин или пароль")
-
-# Сохранение товара
-def save_product_name(message):
-    user_id = message.chat.id
-    if user_id in authorized_users:
-        product_name = message.text
-        with conn.cursor() as cursor:
-            cursor.execute("INSERT INTO products (name, supervisor) VALUES (%s, %s)", (product_name, authorized_users[user_id]))
+            cursor.execute("""
+            INSERT INTO products (supervisor_id, barcode, name, price) 
+            VALUES (%s, %s, %s, %s)
+            """, (authorized_users[message.chat.id], barcode.strip(), name.strip(), price))
             conn.commit()
-        bot.send_message(user_id, f"✅ Товар '{product_name}' добавлен!")
-    else:
-        bot.send_message(user_id, "❌ Ошибка: не авторизован.")
+        bot.send_message(message.chat.id, "✅ Товар добавлен!", reply_markup=main_menu())
+    except Exception as e:
+        logging.error(f"Ошибка при добавлении товара: {e}")
+        bot.send_message(message.chat.id, "❌ Ошибка ввода!")
 
-# Отладка
-@bot.message_handler(commands=['debug'])
-def debug(message):
-    bot.send_message(message.chat.id, f"Auth users: {authorized_users}")
+# Создание заказа
+@bot.message_handler(func=lambda message: message.text == "Создать заказ")
+def order(message):
+    if not is_authorized(message.chat.id):
+        bot.send_message(message.chat.id, "⛔ Вы не авторизованы!")
+        return
+    bot.send_message(message.chat.id, "Введите название магазина:")
+    bot.register_next_step_handler(message, process_order)
 
-# Запуск бота
+def process_order(message):
+    shop_name = message.text
+    bot.send_message(message.chat.id, "Введите штрихкоды и количество через запятую (пример: 123456:2, 654321:5)")
+    bot.register_next_step_handler(message, lambda msg: save_order(msg, shop_name))
+
+def save_order(message, shop_name):
+    order_data = []
+    try:
+        for item in message.text.split(","):
+            barcode, quantity = item.split(":")
+            order_data.append({"barcode": barcode.strip(), "quantity": int(quantity)})
+        with conn.cursor() as cursor:
+            cursor.execute("""
+            INSERT INTO orders (supervisor_id, shop_name, products) VALUES (%s, %s, %s)
+            """, (authorized_users[message.chat.id], shop_name, json.dumps(order_data)))
+            conn.commit()
+        bot.send_message(message.chat.id, "✅ Заказ сохранен!", reply_markup=main_menu())
+    except Exception as e:
+        logging.error(f"Ошибка при создании заказа: {e}")
+        bot.send_message(message.chat.id, "❌ Ошибка ввода!")
+
+# Запуск polling
 bot.polling(none_stop=True, skip_pending=True)
