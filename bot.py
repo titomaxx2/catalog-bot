@@ -1,130 +1,90 @@
 import os
-import logging
 import psycopg2
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Updater, CommandHandler, CallbackContext, MessageHandler, Filters, CallbackQueryHandler, ConversationHandler
-
-# Настройки
-ADMIN_PASSWORD = "admin1234"  # Пароль администратора
-SUPERVISOR_PASSWORD = "supervisor5678"  # Пароль супервайзеров
-DB_URL = os.getenv("DATABASE_URL")
-
-# Логирование
-logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
-logger = logging.getLogger(__name__)
-
-# Состояния диалога
-LOGIN, MENU, ADD_PRODUCT, REMOVE_PRODUCT, ORDER, ADMIN_MENU = range(6)
+from telegram.ext import (Updater, CommandHandler, CallbackContext, MessageHandler,
+                          filters, CallbackQueryHandler, ConversationHandler)
 
 # Подключение к БД
-def get_db_connection():
-    return psycopg2.connect(DB_URL, sslmode="require")
+DB_URL = os.getenv("DATABASE_URL", "postgresql://postgres:9379992Aasd$@db.loghmyfndcfffvcmkqbz.supabase.co:5432/postgres")
+conn = psycopg2.connect(DB_URL, sslmode="require")
+cursor = conn.cursor()
 
-# Стартовое сообщение
-def start(update: Update, context: CallbackContext) -> int:
-    update.message.reply_text("Привет! Введите пароль для входа.")
-    return LOGIN
+# Константы состояний
+ADMIN_PASS, SUPERVISOR_PASS, MAIN_MENU = range(3)
 
-# Обработка пароля
-def login(update: Update, context: CallbackContext) -> int:
-    password = update.message.text
-    user_id = update.message.chat_id
-    
-    if password == ADMIN_PASSWORD:
-        context.user_data['role'] = 'admin'
-        return admin_menu(update, context)
-    elif password == SUPERVISOR_PASSWORD:
-        context.user_data['role'] = 'supervisor'
-        return menu(update, context)
-    else:
-        update.message.reply_text("Неверный пароль! Попробуйте снова.")
-        return LOGIN
+# Пароли
+ADMIN_PASSWORD = "admin123"
+SUPERVISOR_PASSWORD = "super123"
 
-# Главное меню для супервайзеров
-def menu(update: Update, context: CallbackContext) -> int:
-    keyboard = [[InlineKeyboardButton("Добавить товар", callback_data='add_product')],
-                [InlineKeyboardButton("Удалить товар", callback_data='remove_product')],
-                [InlineKeyboardButton("Оформить заказ", callback_data='order')]]
-    
+# Словарь для хранения данных сессий
+sessions = {}
+
+# Команда /start
+def start(update: Update, context: CallbackContext):
+    keyboard = [[InlineKeyboardButton("Вход как администратор", callback_data='admin_login')],
+                [InlineKeyboardButton("Вход как супервайзер", callback_data='supervisor_login')]]
     reply_markup = InlineKeyboardMarkup(keyboard)
-    update.message.reply_text("Выберите действие:", reply_markup=reply_markup)
-    return MENU
+    update.message.reply_text("Выберите роль для входа:", reply_markup=reply_markup)
 
-# Административное меню
-def admin_menu(update: Update, context: CallbackContext) -> int:
-    keyboard = [[InlineKeyboardButton("Добавить супервайзера", callback_data='add_supervisor')],
-                [InlineKeyboardButton("Удалить супервайзера", callback_data='remove_supervisor')]]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    update.message.reply_text("Админ-меню:", reply_markup=reply_markup)
-    return ADMIN_MENU
-
-# Добавление товара
-def add_product(update: Update, context: CallbackContext) -> int:
-    update.message.reply_text("Введите название товара:")
-    return ADD_PRODUCT
-
-def save_product(update: Update, context: CallbackContext) -> int:
-    product_name = update.message.text
-    with get_db_connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute("INSERT INTO products (name) VALUES (%s)", (product_name,))
-            conn.commit()
-    update.message.reply_text("Товар добавлен!")
-    return MENU
-
-# Удаление товара
-def remove_product(update: Update, context: CallbackContext) -> int:
-    update.message.reply_text("Введите название товара для удаления:")
-    return REMOVE_PRODUCT
-
-def delete_product(update: Update, context: CallbackContext) -> int:
-    product_name = update.message.text
-    with get_db_connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute("DELETE FROM products WHERE name = %s", (product_name,))
-            conn.commit()
-    update.message.reply_text("Товар удален!")
-    return MENU
-
-# Обработка кнопок
-def button(update: Update, context: CallbackContext) -> int:
+# Обработчик кнопок входа
+def button_handler(update: Update, context: CallbackContext):
     query = update.callback_query
     query.answer()
-    
-    if query.data == "add_product":
-        query.message.reply_text("Введите название товара:")
-        return ADD_PRODUCT
-    elif query.data == "remove_product":
-        query.message.reply_text("Введите название товара для удаления:")
-        return REMOVE_PRODUCT
-    elif query.data == "order":
-        query.message.reply_text("Оформление заказа пока недоступно.")
-        return MENU
-    elif query.data == "add_supervisor":
-        query.message.reply_text("Введите имя нового супервайзера:")
-        return ADMIN_MENU
-    elif query.data == "remove_supervisor":
-        query.message.reply_text("Введите имя супервайзера для удаления:")
-        return ADMIN_MENU
 
-# Основная функция запуска бота
+    if query.data == 'admin_login':
+        query.message.reply_text("Введите пароль администратора:")
+        return ADMIN_PASS
+    elif query.data == 'supervisor_login':
+        query.message.reply_text("Введите пароль супервайзера:")
+        return SUPERVISOR_PASS
+
+# Проверка пароля администратора
+def admin_pass(update: Update, context: CallbackContext):
+    if update.message.text == ADMIN_PASSWORD:
+        update.message.reply_text("Добро пожаловать, администратор! Вы можете управлять супервайзерами и каталогами.")
+        return MAIN_MENU
+    else:
+        update.message.reply_text("Неверный пароль! Попробуйте снова.")
+        return ADMIN_PASS
+
+# Проверка пароля супервайзера
+def supervisor_pass(update: Update, context: CallbackContext):
+    if update.message.text == SUPERVISOR_PASSWORD:
+        update.message.reply_text("Добро пожаловать, супервайзер! Вы можете управлять своим каталогом товаров.")
+        return MAIN_MENU
+    else:
+        update.message.reply_text("Неверный пароль! Попробуйте снова.")
+        return SUPERVISOR_PASS
+
+# Главное меню
+def main_menu(update: Update, context: CallbackContext):
+    keyboard = [[InlineKeyboardButton("Каталог товаров", callback_data='catalog')],
+                [InlineKeyboardButton("Выход", callback_data='exit')]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    update.message.reply_text("Выберите действие:", reply_markup=reply_markup)
+    return MAIN_MENU
+
+# Обработчик выхода
+def exit_handler(update: Update, context: CallbackContext):
+    update.callback_query.message.reply_text("Вы вышли из системы.")
+    return ConversationHandler.END
+
+# Создание бота
 def main():
-    updater = Updater(os.getenv("TELEGRAM_BOT_TOKEN"), use_context=True)
-    dp = updater.dispatcher
+    updater = Updater(token=os.getenv("TELEGRAM_BOT_TOKEN"), use_context=True)
+    dispatcher = updater.dispatcher
 
     conv_handler = ConversationHandler(
         entry_points=[CommandHandler("start", start)],
         states={
-            LOGIN: [MessageHandler(Filters.text & ~Filters.command, login)],
-            MENU: [CallbackQueryHandler(button)],
-            ADD_PRODUCT: [MessageHandler(Filters.text & ~Filters.command, save_product)],
-            REMOVE_PRODUCT: [MessageHandler(Filters.text & ~Filters.command, delete_product)],
-            ADMIN_MENU: [CallbackQueryHandler(button)],
+            ADMIN_PASS: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_pass)],
+            SUPERVISOR_PASS: [MessageHandler(filters.TEXT & ~filters.COMMAND, supervisor_pass)],
+            MAIN_MENU: [CallbackQueryHandler(exit_handler, pattern='exit')]
         },
-        fallbacks=[CommandHandler("start", start)],
+        fallbacks=[CommandHandler("start", start)]
     )
 
-    dp.add_handler(conv_handler)
+    dispatcher.add_handler(conv_handler)
     updater.start_polling()
     updater.idle()
 
