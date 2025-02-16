@@ -1,92 +1,100 @@
 import os
-import psycopg2
+import logging
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import (Updater, CommandHandler, CallbackContext, MessageHandler,
-                          filters, CallbackQueryHandler, ConversationHandler)
+from telegram.ext import (Application, CommandHandler, CallbackContext, 
+                          MessageHandler, filters, CallbackQueryHandler, ConversationHandler)
 
-# Подключение к БД
-DB_URL = os.getenv("DATABASE_URL", "postgresql://postgres:9379992Aasd$@db.loghmyfndcfffvcmkqbz.supabase.co:5432/postgres")
-conn = psycopg2.connect(DB_URL, sslmode="require")
-cursor = conn.cursor()
+# Логирование
+logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-# Константы состояний
-ADMIN_PASS, SUPERVISOR_PASS, MAIN_MENU = range(3)
+# Состояния
+ADMIN_AUTH, SUPERVISOR_AUTH, CATALOG_MANAGE, ORDER_PROCESS = range(4)
 
 # Пароли
 ADMIN_PASSWORD = "admin123"
 SUPERVISOR_PASSWORD = "super123"
 
-# Словарь для хранения данных сессий
-sessions = {}
+# Хранилище пользователей
+admins = set()
+supervisors = {}
 
-# Команда /start
-def start(update: Update, context: CallbackContext):
-    keyboard = [[InlineKeyboardButton("Вход как администратор", callback_data='admin_login')],
-                [InlineKeyboardButton("Вход как супервайзер", callback_data='supervisor_login')]]
+async def start(update: Update, context: CallbackContext) -> int:
+    keyboard = [[InlineKeyboardButton("Войти как Админ", callback_data='admin')],
+                [InlineKeyboardButton("Войти как Супервайзер", callback_data='supervisor')]]
     reply_markup = InlineKeyboardMarkup(keyboard)
-    update.message.reply_text("Выберите роль для входа:", reply_markup=reply_markup)
+    await update.message.reply_text("Выберите роль для входа:", reply_markup=reply_markup)
+    return ADMIN_AUTH
 
-# Обработчик кнопок входа
-def button_handler(update: Update, context: CallbackContext):
+async def login(update: Update, context: CallbackContext) -> int:
     query = update.callback_query
-    query.answer()
+    await query.answer()
+    if query.data == "admin":
+        await query.message.reply_text("Введите пароль администратора:")
+        return ADMIN_AUTH
+    elif query.data == "supervisor":
+        await query.message.reply_text("Введите пароль супервайзера:")
+        return SUPERVISOR_AUTH
 
-    if query.data == 'admin_login':
-        query.message.reply_text("Введите пароль администратора:")
-        return ADMIN_PASS
-    elif query.data == 'supervisor_login':
-        query.message.reply_text("Введите пароль супервайзера:")
-        return SUPERVISOR_PASS
-
-# Проверка пароля администратора
-def admin_pass(update: Update, context: CallbackContext):
+async def auth_admin(update: Update, context: CallbackContext) -> int:
     if update.message.text == ADMIN_PASSWORD:
-        update.message.reply_text("Добро пожаловать, администратор! Вы можете управлять супервайзерами и каталогами.")
-        return MAIN_MENU
+        admins.add(update.message.chat_id)
+        await update.message.reply_text("Вы вошли как администратор!")
+        return ConversationHandler.END
     else:
-        update.message.reply_text("Неверный пароль! Попробуйте снова.")
-        return ADMIN_PASS
+        await update.message.reply_text("Неверный пароль!")
+        return ADMIN_AUTH
 
-# Проверка пароля супервайзера
-def supervisor_pass(update: Update, context: CallbackContext):
+async def auth_supervisor(update: Update, context: CallbackContext) -> int:
     if update.message.text == SUPERVISOR_PASSWORD:
-        update.message.reply_text("Добро пожаловать, супервайзер! Вы можете управлять своим каталогом товаров.")
-        return MAIN_MENU
+        supervisors[update.message.chat_id] = {}
+        await update.message.reply_text("Вы вошли как супервайзер! Теперь можете управлять каталогом.")
+        return CATALOG_MANAGE
     else:
-        update.message.reply_text("Неверный пароль! Попробуйте снова.")
-        return SUPERVISOR_PASS
+        await update.message.reply_text("Неверный пароль!")
+        return SUPERVISOR_AUTH
 
-# Главное меню
-def main_menu(update: Update, context: CallbackContext):
-    keyboard = [[InlineKeyboardButton("Каталог товаров", callback_data='catalog')],
-                [InlineKeyboardButton("Выход", callback_data='exit')]]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    update.message.reply_text("Выберите действие:", reply_markup=reply_markup)
-    return MAIN_MENU
+async def add_product(update: Update, context: CallbackContext) -> int:
+    chat_id = update.message.chat_id
+    if chat_id not in supervisors:
+        await update.message.reply_text("Вы не авторизованы!")
+        return ConversationHandler.END
+    args = context.args
+    if len(args) < 2:
+        await update.message.reply_text("Используйте: /add Товар Цена")
+        return CATALOG_MANAGE
+    product, price = " ".join(args[:-1]), args[-1]
+    supervisors[chat_id][product] = price
+    await update.message.reply_text(f"Товар {product} добавлен по цене {price}.")
+    return CATALOG_MANAGE
 
-# Обработчик выхода
-def exit_handler(update: Update, context: CallbackContext):
-    update.callback_query.message.reply_text("Вы вышли из системы.")
+async def show_catalog(update: Update, context: CallbackContext) -> None:
+    chat_id = update.message.chat_id
+    if chat_id not in supervisors or not supervisors[chat_id]:
+        await update.message.reply_text("Каталог пуст.")
+        return
+    text = "Каталог товаров:\n" + "\n".join([f"{item}: {price}" for item, price in supervisors[chat_id].items()])
+    await update.message.reply_text(text)
+
+async def cancel(update: Update, context: CallbackContext) -> int:
+    await update.message.reply_text("Операция отменена.")
     return ConversationHandler.END
 
-# Создание бота
+# Основная функция
 def main():
-    updater = Updater(token=os.getenv("TELEGRAM_BOT_TOKEN"), use_context=True)
-    dispatcher = updater.dispatcher
-
+    app = Application.builder().token(os.getenv("TELEGRAM_BOT_TOKEN")).build()
     conv_handler = ConversationHandler(
         entry_points=[CommandHandler("start", start)],
         states={
-            ADMIN_PASS: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_pass)],
-            SUPERVISOR_PASS: [MessageHandler(filters.TEXT & ~filters.COMMAND, supervisor_pass)],
-            MAIN_MENU: [CallbackQueryHandler(exit_handler, pattern='exit')]
+            ADMIN_AUTH: [MessageHandler(filters.TEXT & ~filters.COMMAND, auth_admin)],
+            SUPERVISOR_AUTH: [MessageHandler(filters.TEXT & ~filters.COMMAND, auth_supervisor)],
+            CATALOG_MANAGE: [CommandHandler("add", add_product), CommandHandler("catalog", show_catalog)],
         },
-        fallbacks=[CommandHandler("start", start)]
+        fallbacks=[CommandHandler("cancel", cancel)],
     )
-
-    dispatcher.add_handler(conv_handler)
-    updater.start_polling()
-    updater.idle()
+    app.add_handler(conv_handler)
+    app.add_handler(CallbackQueryHandler(login))
+    app.run_polling()
 
 if __name__ == "__main__":
     main()
