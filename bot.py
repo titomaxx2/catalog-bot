@@ -1,9 +1,12 @@
 import os
 import logging
-import json
 import time
 import psycopg2
 import telebot
+from openpyxl import Workbook
+from pyzbar.pyzbar import decode
+from PIL import Image
+from io import BytesIO
 from telebot.types import (
     ReplyKeyboardMarkup,
     KeyboardButton,
@@ -29,14 +32,6 @@ user_states = {}
 def init_db():
     commands = (
         """
-        CREATE TABLE IF NOT EXISTS supervisors (
-            id SERIAL PRIMARY KEY,
-            telegram_id BIGINT UNIQUE NOT NULL,
-            username TEXT,
-            created_at TIMESTAMP DEFAULT NOW()
-        )
-        """,
-        """
         CREATE TABLE IF NOT EXISTS products (
             id SERIAL PRIMARY KEY,
             telegram_id BIGINT NOT NULL,
@@ -46,7 +41,7 @@ def init_db():
             image_id TEXT,
             created_at TIMESTAMP DEFAULT NOW()
         )
-        """
+        """,
     )
     
     with psycopg2.connect(DB_URL, sslmode="require") as conn:
@@ -57,34 +52,29 @@ def init_db():
 
 init_db()
 
-# Авторизация пользователя
-def register_user(telegram_id):
-    with psycopg2.connect(DB_URL, sslmode="require") as conn:
-        with conn.cursor() as cursor:
-            cursor.execute(
-                "INSERT INTO supervisors (telegram_id) "
-                "VALUES (%s) ON CONFLICT (telegram_id) DO NOTHING",
-                (telegram_id,)
-            )
-            conn.commit()
-
 # Клавиатуры
 def main_menu():
     markup = ReplyKeyboardMarkup(resize_keyboard=True)
     markup.add(KeyboardButton("➕ Добавить товар"))
-    markup.add(KeyboardButton("📦 Каталог"))
+    markup.add(KeyboardButton("📦 Каталог"),
+               KeyboardButton("📤 Экспорт"))
+    markup.add(KeyboardButton("📷 Сканировать штрихкод"))
+    return markup
+
+def scan_menu():
+    markup = ReplyKeyboardMarkup(resize_keyboard=True)
+    markup.add(KeyboardButton("Отмена"))
     return markup
 
 def catalog_menu():
     markup = InlineKeyboardMarkup()
     markup.add(InlineKeyboardButton("Редактировать", callback_data="edit"),
-                InlineKeyboardButton("Удалить", callback_data="delete"))
+               InlineKeyboardButton("Удалить", callback_data="delete"))
     return markup
 
 # Обработчики команд
 @bot.message_handler(commands=['start'])
 def handle_start(message):
-    register_user(message.chat.id)
     bot.send_message(message.chat.id, "Добро пожаловать!", reply_markup=main_menu())
 
 @bot.message_handler(func=lambda m: m.text == "➕ Добавить товар")
@@ -220,6 +210,110 @@ def delete_product(message):
         logger.error(f"Ошибка удаления: {e}")
         bot.send_message(message.chat.id, "❌ Ошибка удаления. Проверьте баркод.")
         del user_states[message.chat.id]
+
+@bot.message_handler(func=lambda m: m.text == "📤 Экспорт")
+def handle_export(message):
+    try:
+        with psycopg2.connect(DB_URL, sslmode="require") as conn:
+            with conn.cursor() as cursor:
+                cursor.execute("""
+                    SELECT barcode, name, price, created_at 
+                    FROM products 
+                    WHERE telegram_id = %s
+                    ORDER BY created_at DESC
+                """, (message.chat.id,))
+                data = cursor.fetchall()
+
+        if not data:
+            bot.send_message(message.chat.id, "❌ Нет данных для экспорта")
+            return
+
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "Каталог товаров"
+        ws.append(["Штрихкод", "Название", "Цена", "Дата добавления"])
+        
+        for item in data:
+            ws.append([item[0], item[1], item[2], item[3].strftime("%Y-%m-%d %H:%M")])
+        
+        filename = f"catalog_{message.chat.id}.xlsx"
+        wb.save(filename)
+        
+        with open(filename, "rb") as f:
+            bot.send_document(message.chat.id, f)
+        
+        os.remove(filename)
+    
+    except Exception as e:
+        logger.error(f"Ошибка экспорта: {e}")
+        bot.send_message(message.chat.id, "❌ Ошибка при экспорте данных")
+
+@bot.message_handler(func=lambda m: m.text == "📷 Сканировать штрихкод")
+def handle_scan(message):
+    markup = ReplyKeyboardMarkup(resize_keyboard=True)
+    markup.add(KeyboardButton("Отмена"))
+    msg = bot.send_message(
+        message.chat.id,
+        "📷 Сфотографируйте штрихкод или отправьте изображение",
+        reply_markup=markup
+    )
+    user_states[message.chat.id] = {'step': 'awaiting_barcode_scan'}
+
+@bot.message_handler(content_types=['photo'], 
+                   func=lambda m: user_states.get(m.chat.id, {}).get('step') == 'awaiting_barcode_scan')
+def process_barcode_scan(message):
+    try:
+        file_info = bot.get_file(message.photo[-1].file_id)
+        downloaded_file = bot.download_file(file_info.file_path)
+        
+        img = Image.open(BytesIO(downloaded_file))
+        decoded_objects = decode(img)
+        
+        if decoded_objects:
+            barcode = decoded_objects[0].data.decode('utf-8')
+            response = f"✅ Распознан штрихкод: `{barcode}`\n"
+            
+            with psycopg2.connect(DB_URL, sslmode="require") as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute("""
+                        SELECT name, price FROM products 
+                        WHERE barcode = %s AND telegram_id = %s
+                    """, (barcode, message.chat.id))
+                    product = cursor.fetchone()
+                    
+            if product:
+                response += f"📦 Товар в базе:\nНазвание: {product[0]}\nЦена: {product[1]} руб."
+            else:
+                response += "❌ Товар не найден в базе"
+        else:
+            response = "❌ Не удалось распознать штрихкод"
+        
+        bot.send_message(
+            message.chat.id,
+            response,
+            parse_mode='Markdown',
+            reply_markup=main_menu()
+        )
+        del user_states[message.chat.id]
+        
+    except Exception as e:
+        logger.error(f"Ошибка сканирования: {e}")
+        bot.send_message(
+            message.chat.id,
+            "⚠️ Ошибка обработки изображения",
+            reply_markup=main_menu()
+        )
+        del user_states[message.chat.id]
+
+@bot.message_handler(func=lambda m: user_states.get(m.chat.id, {}).get('step') == 'awaiting_barcode_scan' 
+                   and m.text == "Отмена")
+def cancel_scan(message):
+    del user_states[message.chat.id]
+    bot.send_message(
+        message.chat.id,
+        "❌ Сканирование отменено",
+        reply_markup=main_menu()
+    )
 
 if __name__ == "__main__":
     logger.info("Бот запущен")
