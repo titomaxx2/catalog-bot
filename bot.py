@@ -2,7 +2,10 @@ import os
 import logging
 import psycopg2
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, CallbackContext, ConversationHandler
+from telegram.ext import (
+    Application, CommandHandler, MessageHandler, CallbackQueryHandler,
+    ConversationHandler, filters, CallbackContext
+)
 
 # Настройки бота
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -13,14 +16,12 @@ conn = psycopg2.connect(DB_URL)
 cur = conn.cursor()
 
 # Логирование
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
-)
+logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
 
 # Состояния для авторизации
 ADMIN_AUTH, SUPERVISOR_AUTH = range(2)
 
-# Главная команда /start
+# Команда /start
 async def start(update: Update, context: CallbackContext):
     buttons = [
         [InlineKeyboardButton("Я администратор", callback_data="admin")],
@@ -29,7 +30,7 @@ async def start(update: Update, context: CallbackContext):
     keyboard = InlineKeyboardMarkup(buttons)
     await update.message.reply_text("Выберите вашу роль:", reply_markup=keyboard)
 
-# Обработка нажатий кнопок выбора роли
+# Обработка нажатия кнопок
 async def role_selection(update: Update, context: CallbackContext):
     query = update.callback_query
     await query.answer()
@@ -85,6 +86,7 @@ def main():
     )
 
     app.add_handler(conv_handler)
+    app.add_handler(CallbackQueryHandler(role_selection))  # Обработчик кнопок
     app.add_handler(CommandHandler("add_product", add_product))
 
     app.run_polling()
