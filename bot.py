@@ -401,8 +401,12 @@ def process_barcode_scan(message):
                 parsed_text = result['ParsedResults'][0].get('ParsedText', '')
                 logger.info(f"Распознанный текст: {parsed_text}")
 
+                # Удаляем символы новой строки и пробелы
+                cleaned_text = parsed_text.replace("\n", "").replace(" ", "")
+                logger.info(f"Очищенный текст: {cleaned_text}")
+
                 # Поиск штрихкода
-                numbers = [word.strip() for word in parsed_text.split() if word.strip().isdigit()]
+                numbers = [word.strip() for word in cleaned_text.split() if word.strip().isdigit()]
                 valid_barcodes = [num for num in numbers if 8 <= len(num) <= 15]
                 
                 if valid_barcodes:
