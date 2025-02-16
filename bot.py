@@ -3,7 +3,7 @@ import logging
 import json
 import telebot
 import psycopg2
-from telebot.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
+from telebot.types import ReplyKeyboardMarkup, KeyboardButton
 
 # Логирование
 logging.basicConfig(level=logging.INFO)
@@ -18,37 +18,41 @@ if not TOKEN or not DB_URL or not GITHUB_REPO or not GITHUB_TOKEN:
     raise ValueError("Отсутствуют необходимые переменные окружения")
 
 bot = telebot.TeleBot(TOKEN)
-conn = psycopg2.connect(DB_URL, sslmode="require")
 
-# Инициализация БД
-with conn:
-    with conn.cursor() as cursor:
-        cursor.execute("""
-        CREATE TABLE IF NOT EXISTS supervisors (
-            id SERIAL PRIMARY KEY,
-            telegram_id BIGINT UNIQUE,
-            username TEXT UNIQUE,
-            password TEXT
-        );
-        """)
-        cursor.execute("""
-        CREATE TABLE IF NOT EXISTS products (
-            id SERIAL PRIMARY KEY,
-            supervisor_id INT REFERENCES supervisors(id) ON DELETE CASCADE,
-            barcode TEXT,
-            name TEXT,
-            price FLOAT,
-            image_url TEXT
-        );
-        """)
-        cursor.execute("""
-        CREATE TABLE IF NOT EXISTS orders (
-            id SERIAL PRIMARY KEY,
-            supervisor_id INT REFERENCES supervisors(id) ON DELETE CASCADE,
-            shop_name TEXT,
-            products JSONB
-        );
-        """)
+# Создание таблиц
+def init_db():
+    conn = psycopg2.connect(DB_URL, sslmode="require")
+    with conn:
+        with conn.cursor() as cursor:
+            cursor.execute("""
+            CREATE TABLE IF NOT EXISTS supervisors (
+                id SERIAL PRIMARY KEY,
+                telegram_id BIGINT UNIQUE,
+                username TEXT UNIQUE,
+                password TEXT
+            );
+            """)
+            cursor.execute("""
+            CREATE TABLE IF NOT EXISTS products (
+                id SERIAL PRIMARY KEY,
+                supervisor_id INT REFERENCES supervisors(id) ON DELETE CASCADE,
+                barcode TEXT,
+                name TEXT,
+                price FLOAT,
+                image_url TEXT
+            );
+            """)
+            cursor.execute("""
+            CREATE TABLE IF NOT EXISTS orders (
+                id SERIAL PRIMARY KEY,
+                supervisor_id INT REFERENCES supervisors(id) ON DELETE CASCADE,
+                shop_name TEXT,
+                products JSONB
+            );
+            """)
+    conn.close()
+
+init_db()
 
 # Авторизация
 supervisors = {}
@@ -57,12 +61,16 @@ def is_authorized(user_id):
     return user_id in supervisors
 
 def authorize(user_id, username, password):
-    with conn.cursor() as cursor:
-        cursor.execute("SELECT id FROM supervisors WHERE username = %s AND password = %s", (username, password))
-        supervisor = cursor.fetchone()
-        if supervisor:
-            supervisors[user_id] = supervisor[0]
-            return True
+    conn = psycopg2.connect(DB_URL, sslmode="require")  # Открываем новое соединение
+    cursor = conn.cursor()
+    cursor.execute("SELECT id FROM supervisors WHERE username = %s AND password = %s", (username, password))
+    supervisor = cursor.fetchone()
+    cursor.close()
+    conn.close()
+
+    if supervisor:
+        supervisors[user_id] = supervisor[0]
+        return True
     return False
 
 @bot.message_handler(commands=['start'])
@@ -97,12 +105,15 @@ def process_product(message):
     try:
         barcode, name, price = message.text.split(",")
         price = float(price)
-        with conn.cursor() as cursor:
-            cursor.execute("""
-            INSERT INTO products (supervisor_id, barcode, name, price) 
-            VALUES (%s, %s, %s, %s)
-            """, (supervisors[message.chat.id], barcode.strip(), name.strip(), price))
-            conn.commit()
+        conn = psycopg2.connect(DB_URL, sslmode="require")
+        cursor = conn.cursor()
+        cursor.execute("""
+        INSERT INTO products (supervisor_id, barcode, name, price) 
+        VALUES (%s, %s, %s, %s)
+        """, (supervisors[message.chat.id], barcode.strip(), name.strip(), price))
+        conn.commit()
+        cursor.close()
+        conn.close()
         bot.send_message(message.chat.id, "✅ Товар добавлен!", reply_markup=main_menu())
     except:
         bot.send_message(message.chat.id, "❌ Ошибка ввода!")
@@ -127,17 +138,17 @@ def save_order(message, shop_name):
         for item in message.text.split(","):
             barcode, quantity = item.split(":")
             order_data.append({"barcode": barcode.strip(), "quantity": int(quantity)})
-        with conn.cursor() as cursor:
-            cursor.execute("""
-            INSERT INTO orders (supervisor_id, shop_name, products) VALUES (%s, %s, %s)
-            """, (supervisors[message.chat.id], shop_name, json.dumps(order_data)))
-            conn.commit()
+        conn = psycopg2.connect(DB_URL, sslmode="require")
+        cursor = conn.cursor()
+        cursor.execute("""
+        INSERT INTO orders (supervisor_id, shop_name, products) VALUES (%s, %s, %s)
+        """, (supervisors[message.chat.id], shop_name, json.dumps(order_data)))
+        conn.commit()
+        cursor.close()
+        conn.close()
         bot.send_message(message.chat.id, "✅ Заказ сохранен!", reply_markup=main_menu())
     except:
         bot.send_message(message.chat.id, "❌ Ошибка ввода!")
 
 # Запуск
-try:
-    bot.polling(none_stop=True, skip_pending=True)
-finally:
-    conn.close()
+bot.polling(none_stop=True, skip_pending=True)
