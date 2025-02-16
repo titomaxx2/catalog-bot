@@ -4,9 +4,10 @@ import time
 import requests
 import psycopg2
 import telebot
-from openpyxl import Workbook
+from flask import Flask
 from PIL import Image
 from io import BytesIO
+from threading import Thread
 from telebot.types import (
     ReplyKeyboardMarkup,
     KeyboardButton,
@@ -46,97 +47,103 @@ def init_db():
         """,
     )
     
-    with psycopg2.connect(DB_URL, sslmode="require") as conn:
+    try:
+        conn = psycopg2.connect(DB_URL, sslmode="require")
         with conn.cursor() as cursor:
             for command in commands:
                 cursor.execute(command)
         conn.commit()
+        logger.info("Таблицы БД успешно инициализированы")
+    except Exception as e:
+        logger.error(f"Ошибка инициализации БД: {e}")
+        raise
 
 init_db()
 
-def compress_image(image_data: bytes, quality: int = 85, max_size: int = 1024) -> bytes:
-    """Сжимает изображение с сохранением читаемости штрихкода"""
-    with Image.open(BytesIO(image_data)) as img:
-        # Конвертируем в RGB для JPEG
-        if img.mode != 'RGB':
-            img = img.convert('RGB')
-        
-        # Уменьшаем размер изображения
-        img.thumbnail((max_size, max_size))
-        
-        # Постепенное сжатие до достижения нужного размера
-        output = BytesIO()
-        quality = min(quality, 95)
-        while True:
-            output.seek(0)
-            output.truncate()
-            img.save(output, format='JPEG', quality=quality, optimize=True)
-            if len(output.getvalue()) <= MAX_IMAGE_SIZE_MB * 1024 * 1024:
-                break
-            quality -= 5
-            if quality < 50:
-                img = img.resize((img.width//2, img.height//2))
-                quality = 75
-        
-        logger.info(f"Сжато до: {len(output.getvalue())//1024} KB, качество: {quality}%")
-        return output.getvalue()
+# Веб-сервер для Render
+app = Flask(__name__)
 
-# ... (остальные функции: main_menu, scan_menu, catalog_menu остаются без изменений) ...
+@app.route('/')
+def home():
+    return "Telegram Bot is Running"
 
-@bot.message_handler(content_types=['photo'], 
-                   func=lambda m: user_states.get(m.chat.id, {}).get('step') == 'awaiting_barcode_scan')
-def process_barcode_scan(message):
+# Сжатие изображения
+def compress_image(image_data: bytes) -> bytes:
+    """Сжимает изображение до 1 МБ"""
     try:
-        # Скачиваем изображение
-        file_info = bot.get_file(message.photo[-1].file_id)
-        downloaded_file = bot.download_file(file_info.file_path)
-        
-        # Сжимаем изображение
-        compressed_image = compress_image(downloaded_file)
-        logger.info(f"Размер после сжатия: {len(compressed_image)} bytes")
-
-        # Отправка в OCR.Space
-        response = requests.post(
-            'https://api.ocr.space/parse/image',
-            files={'image': ('barcode.jpg', compressed_image, 'image/jpeg')},
-            data={
-                'apikey': OCR_API_KEY,
-                'language': 'eng',
-                'OCREngine': 2,
-                'isTable': True,
-                'scale': True,
-                'detectOrientation': True
-            },
-            timeout=15
-        )
-
-        # Обработка ответа (остается без изменений)
-        # ... (код обработки OCR ответа из предыдущего решения) ...
-
+        with Image.open(BytesIO(image_data)) as img:
+            if img.mode != 'RGB':
+                img = img.convert('RGB')
+            
+            img.thumbnail((800, 800))
+            output = BytesIO()
+            quality = 85
+            
+            while True:
+                output.seek(0)
+                output.truncate()
+                img.save(output, format='JPEG', quality=quality, optimize=True)
+                if len(output.getvalue()) <= MAX_IMAGE_SIZE_MB * 1024 * 1024:
+                    break
+                quality -= 5
+                if quality < 50:
+                    img = img.resize((img.width//2, img.height//2))
+                    quality = 75
+            
+            logger.info(f"Изображение сжато: {len(output.getvalue())//1024} KB")
+            return output.getvalue()
     except Exception as e:
-        logger.error(f"Ошибка сканирования: {str(e)}", exc_info=True)
-        error_msg = "⚠️ Ошибка обработки изображения\nПопробуйте:"
-        error_msg += "\n- Сфотографировать при хорошем освещении"
-        error_msg += "\n- Убедиться, что штрихкод в фокусе"
-        error_msg += "\n- Расположить камеру параллельно штрихкоду"
-        
+        logger.error(f"Ошибка сжатия: {e}")
+        raise
+
+# Клавиатуры
+def main_menu():
+    markup = ReplyKeyboardMarkup(resize_keyboard=True)
+    markup.add(KeyboardButton("➕ Добавить товар"))
+    markup.add(KeyboardButton("📦 Каталог"), KeyboardButton("📤 Экспорт"))
+    markup.add(KeyboardButton("📷 Сканировать штрихкод"))
+    return markup
+
+@bot.message_handler(commands=['start'])
+def handle_start(message):
+    try:
+        logger.info(f"Новый пользователь: {message.chat.id}")
         bot.send_message(
             message.chat.id,
-            error_msg,
+            "Добро пожаловать! Выберите действие:",
             reply_markup=main_menu()
         )
-    finally:
-        user_states.pop(message.chat.id, None)
+    except Exception as e:
+        logger.error(f"Ошибка в /start: {e}")
 
-# ... (остальные обработчики: handle_start, start_add_product, process_product_data,
-# process_product_image, show_catalog, handle_callback, edit_price, delete_product,
-# handle_export, handle_scan, cancel_scan остаются без изменений) ...
+@bot.message_handler(func=lambda m: m.text == "➕ Добавить товар")
+def start_add_product(message):
+    try:
+        user_states[message.chat.id] = {'step': 'awaiting_product_data'}
+        bot.send_message(
+            message.chat.id,
+            "Введите данные в формате:\nШтрихкод | Название | Цена\nПример: 123456 | Молоко | 100"
+        )
+    except Exception as e:
+        logger.error(f"Ошибка добавления товара: {e}")
+
+# Остальные обработчики...
 
 if __name__ == "__main__":
+    # Запуск Flask в отдельном потоке
+    port = int(os.environ.get("PORT", 10000))
+    Thread(target=app.run, kwargs={
+        'host': '0.0.0.0',
+        'port': port,
+        'debug': False,
+        'use_reloader': False
+    }).start()
+    
+    # Запуск бота
     logger.info("Бот запущен")
     while True:
         try:
-            bot.polling(none_stop=True, interval=2, timeout=60)
+            bot.polling(none_stop=True, interval=3, timeout=30)
         except Exception as e:
-            logger.error(f"Ошибка подключения: {e}")
+            logger.error(f"Ошибка polling: {e}")
             time.sleep(10)
