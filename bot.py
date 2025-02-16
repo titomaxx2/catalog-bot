@@ -6,7 +6,7 @@ import psycopg2
 import telebot
 import json
 from flask import Flask
-from PIL import Image
+from PIL import Image, ImageEnhance
 from io import BytesIO
 from threading import Thread
 from openpyxl import Workbook
@@ -24,7 +24,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Инициализация бота ПЕРВОЙ
+# Инициализация бота
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 bot = telebot.TeleBot(TOKEN)
 
@@ -80,7 +80,7 @@ def compress_image(image_data: bytes) -> bytes:
             if img.mode != 'RGB':
                 img = img.convert('RGB')
             
-            img.thumbnail((800, 800))
+            # Сохраняем изображение с уменьшенным качеством
             output = BytesIO()
             quality = 85
             
@@ -92,13 +92,37 @@ def compress_image(image_data: bytes) -> bytes:
                     break
                 quality -= 5
                 if quality < 50:
-                    img = img.resize((img.width//2, img.height//2))
-                    quality = 75
+                    break
             
             logger.info(f"Изображение сжато до {len(output.getvalue())//1024} KB")
             return output.getvalue()
     except Exception as e:
         logger.error(f"Ошибка сжатия: {e}")
+        raise
+
+def preprocess_image(image_data: bytes) -> bytes:
+    """
+    Предварительная обработка изображения для улучшения распознавания.
+    """
+    try:
+        # Открываем изображение с помощью Pillow
+        image = Image.open(BytesIO(image_data))
+        
+        # Увеличение контрастности
+        enhancer = ImageEnhance.Contrast(image)
+        image = enhancer.enhance(2.0)  # Увеличиваем контрастность в 2 раза
+        
+        # Преобразуем изображение в grayscale
+        image = image.convert('L')
+        
+        # Сохраняем изображение в BytesIO
+        output = BytesIO()
+        image.save(output, format='JPEG', quality=85)
+        output.seek(0)
+        
+        return output.getvalue()
+    except Exception as e:
+        logger.error(f"Ошибка обработки изображения: {e}")
         raise
 
 # Клавиатуры
@@ -340,40 +364,59 @@ def process_barcode_scan(message):
         file_info = bot.get_file(message.photo[-1].file_id)
         downloaded_file = bot.download_file(file_info.file_path)
         
-        # Сжатие изображения
-        compressed_image = compress_image(downloaded_file)
+        # Предварительная обработка изображения
+        processed_image = preprocess_image(downloaded_file)
+        
+        # Сжатие изображения (если необходимо)
+        compressed_image = compress_image(processed_image)
         logger.debug(f"Размер изображения для OCR: {len(compressed_image)} байт")
 
         # Отправка в OCR API
-        response = requests.post(
-            'https://api.ocr.space/parse/image',
-            files={'image': ('barcode.jpg', compressed_image, 'image/jpeg')},
-            data={'apikey': OCR_API_KEY, 'OCREngine': 2},
-            timeout=60
-        )
-        
-        # Обработка ответа
-        if response.status_code != 200:
-            raise Exception(f"HTTP Error {response.status_code}")
-        
-        result = response.json()
-        logger.debug(f"Ответ OCR: {json.dumps(result, indent=2)}")
-
-        # Проверка структуры ответа
-        if not result.get('ParsedResults'):
-            raise Exception("Некорректный ответ от OCR API")
-        
-        parsed_text = result['ParsedResults'][0].get('ParsedText', '')
-        logger.debug(f"Распознанный текст: {parsed_text}")
-
-        # Поиск штрихкода
+        max_retries = 3
+        retry_delay = 5  # Задержка между попытками в секундах
         barcode = None
-        numbers = [word.strip() for word in parsed_text.split() if word.strip().isdigit()]
-        valid_barcodes = [num for num in numbers if 8 <= len(num) <= 15]
-        
-        if valid_barcodes:
-            barcode = max(valid_barcodes, key=len)
-            logger.info(f"Найден штрихкод: {barcode}")
+
+        for attempt in range(max_retries):
+            try:
+                response = requests.post(
+                    'https://api.ocr.space/parse/image',
+                    files={'image': ('barcode.jpg', compressed_image, 'image/jpeg')},
+                    data={'apikey': OCR_API_KEY, 'OCREngine': 2},
+                    timeout=30
+                )
+                
+                # Обработка ответа
+                if response.status_code != 200:
+                    raise Exception(f"HTTP Error {response.status_code}")
+                
+                result = response.json()
+                logger.debug(f"Ответ OCR: {json.dumps(result, indent=2)}")
+
+                # Проверка структуры ответа
+                if not result.get('ParsedResults'):
+                    raise Exception("Некорректный ответ от OCR API")
+                
+                parsed_text = result['ParsedResults'][0].get('ParsedText', '')
+                logger.debug(f"Распознанный текст: {parsed_text}")
+
+                # Поиск штрихкода
+                numbers = [word.strip() for word in parsed_text.split() if word.strip().isdigit()]
+                valid_barcodes = [num for num in numbers if 8 <= len(num) <= 15]
+                
+                if valid_barcodes:
+                    barcode = max(valid_barcodes, key=len)
+                    logger.info(f"Найден штрихкод: {barcode}")
+                    break  # Успешное распознавание, выходим из цикла
+                else:
+                    logger.warning(f"Попытка {attempt + 1}: Штрихкод не распознан")
+                    if attempt < max_retries - 1:
+                        time.sleep(retry_delay)
+            except Exception as e:
+                logger.error(f"Попытка {attempt + 1} не удалась: {e}")
+                if attempt < max_retries - 1:
+                    time.sleep(retry_delay)
+                else:
+                    raise  # Если все попытки исчерпаны, выбрасываем исключение
 
         # Отправка результата
         if barcode:
