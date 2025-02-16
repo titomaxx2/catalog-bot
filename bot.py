@@ -52,7 +52,7 @@ with conn:
 # Функция для проверки авторизации
 def is_authorized(user_id):
     with conn.cursor() as cursor:
-        cursor.execute("SELECT id FROM supervisors WHERE telegram_id = %s AND is_authorized = TRUE", (user_id,))
+        cursor.execute("SELECT id FROM supervisors WHERE telegram_id = %s", (user_id,))
         return cursor.fetchone() is not None
 
 # Функция для авторизации
@@ -64,6 +64,7 @@ def authorize(user_id, username, password):
             logging.info(f"Авторизация успешна для пользователя: {username} (ID: {supervisor[0]})")
             cursor.execute("UPDATE supervisors SET telegram_id = %s, is_authorized = TRUE WHERE id = %s", (user_id, supervisor[0]))
             conn.commit()
+            logging.info(f"Обновлен telegram_id и is_authorized для пользователя: {username} (ID: {supervisor[0]})")
             return True
         else:
             logging.warning(f"Ошибка авторизации для пользователя: {username} (Неверный логин или пароль)")
