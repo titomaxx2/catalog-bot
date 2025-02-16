@@ -1,6 +1,6 @@
 import os
 import logging
-import psycopg2
+import asyncpg
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, CallbackContext, CallbackQueryHandler
 
@@ -13,12 +13,12 @@ TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 DB_URL = os.getenv("DATABASE_URL")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))  # ID админа
 
-# Подключение к базе данных Supabase
-conn = psycopg2.connect(DB_URL)
-cur = conn.cursor()
-
 # Глобальный список пользователей (супервайзеров)
 supervisors = {}
+
+# Подключение к базе данных
+async def connect_db():
+    return await asyncpg.connect(DB_URL)
 
 # Команда /start
 async def start(update: Update, context: CallbackContext) -> None:
@@ -41,11 +41,12 @@ async def handle_message(update: Update, context: CallbackContext) -> None:
     user_id = update.effective_user.id
     text = update.message.text.strip()
 
-    # Обработка логина
     if " " in text:
         login, password = text.split(" ", 1)
-        cur.execute("SELECT id FROM supervisors WHERE login = %s AND password = %s", (login, password))
-        result = cur.fetchone()
+        conn = await connect_db()
+        result = await conn.fetchrow("SELECT id FROM supervisors WHERE login = $1 AND password = $2", login, password)
+        await conn.close()
+
         if result:
             supervisors[user_id] = login
             await update.message.reply_text("Вы успешно вошли! Используйте /catalog для работы с каталогом.")
@@ -61,25 +62,26 @@ async def button_callback(update: Update, context: CallbackContext) -> None:
         await query.answer("У вас нет прав!", show_alert=True)
         return
 
+    conn = await connect_db()
+
     if query.data == "add_supervisor":
         await query.message.reply_text("Введите данные супервайзера: логин пароль")
     elif query.data == "remove_supervisor":
-        cur.execute("SELECT login FROM supervisors")
-        supervisors_list = cur.fetchall()
+        supervisors_list = await conn.fetch("SELECT login FROM supervisors")
         if not supervisors_list:
             await query.message.reply_text("Нет зарегистрированных супервайзеров.")
+            await conn.close()
             return
 
-        keyboard = [[InlineKeyboardButton(sup[0], callback_data=f"del_{sup[0]}")] for sup in supervisors_list]
+        keyboard = [[InlineKeyboardButton(sup["login"], callback_data=f"del_{sup['login']}")] for sup in supervisors_list]
         reply_markup = InlineKeyboardMarkup(keyboard)
         await query.message.reply_text("Выберите супервайзера для удаления:", reply_markup=reply_markup)
-
     elif query.data.startswith("del_"):
         login_to_delete = query.data[4:]
-        cur.execute("DELETE FROM supervisors WHERE login = %s", (login_to_delete,))
-        conn.commit()
+        await conn.execute("DELETE FROM supervisors WHERE login = $1", login_to_delete)
         await query.message.reply_text(f"Супервайзер {login_to_delete} удален.")
 
+    await conn.close()
     await query.answer()
 
 # Функция запуска бота
@@ -96,15 +98,13 @@ async def main() -> None:
 # Запуск бота
 if __name__ == "__main__":
     import asyncio
-
-    # Убедимся, что цикл событий не запущен
+    
     try:
         asyncio.run(main())
     except RuntimeError as e:
-        if str(e) == "Event loop is closed":
-            # Если цикл событий уже закрыт, запускаем его вручную
+        if "Event loop is closed" in str(e):
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
             loop.run_until_complete(main())
         else:
-            raise e
+            raise
