@@ -1,3 +1,4 @@
 pyTelegramBotAPI
 psycopg2-binary
 python-telegram-bot==20.0
+asyncpg
