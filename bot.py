@@ -1,5 +1,6 @@
 import os
 import logging
+import json
 import telebot
 import psycopg2
 from telebot.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
@@ -72,12 +73,19 @@ def start_message(message):
 def login(message):
     username, password = message.text.split(" ", 1)
     if authorize(message.chat.id, username, password):
-        bot.send_message(message.chat.id, "✅ Вход выполнен!")
+        bot.send_message(message.chat.id, "✅ Вход выполнен!", reply_markup=main_menu())
     else:
         bot.send_message(message.chat.id, "❌ Неверный логин или пароль")
 
+# Главное меню
+def main_menu():
+    markup = ReplyKeyboardMarkup(resize_keyboard=True)
+    markup.add(KeyboardButton("Добавить товар"))
+    markup.add(KeyboardButton("Создать заказ"))
+    return markup
+
 # Добавление товаров
-@bot.message_handler(commands=['add_product'])
+@bot.message_handler(func=lambda message: message.text == "Добавить товар")
 def add_product(message):
     if not is_authorized(message.chat.id):
         bot.send_message(message.chat.id, "⛔ Вы не авторизованы!")
@@ -95,12 +103,12 @@ def process_product(message):
             VALUES (%s, %s, %s, %s)
             """, (supervisors[message.chat.id], barcode.strip(), name.strip(), price))
             conn.commit()
-        bot.send_message(message.chat.id, "✅ Товар добавлен!")
+        bot.send_message(message.chat.id, "✅ Товар добавлен!", reply_markup=main_menu())
     except:
         bot.send_message(message.chat.id, "❌ Ошибка ввода!")
 
-# Заказы
-@bot.message_handler(commands=['order'])
+# Создание заказа
+@bot.message_handler(func=lambda message: message.text == "Создать заказ")
 def order(message):
     if not is_authorized(message.chat.id):
         bot.send_message(message.chat.id, "⛔ Вы не авторизованы!")
@@ -124,7 +132,7 @@ def save_order(message, shop_name):
             INSERT INTO orders (supervisor_id, shop_name, products) VALUES (%s, %s, %s)
             """, (supervisors[message.chat.id], shop_name, json.dumps(order_data)))
             conn.commit()
-        bot.send_message(message.chat.id, "✅ Заказ сохранен!")
+        bot.send_message(message.chat.id, "✅ Заказ сохранен!", reply_markup=main_menu())
     except:
         bot.send_message(message.chat.id, "❌ Ошибка ввода!")
 
