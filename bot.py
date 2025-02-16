@@ -11,66 +11,56 @@ logging.basicConfig(level=logging.INFO)
 # Получаем переменные окружения
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 DB_URL = os.getenv("DATABASE_URL")
-GITHUB_REPO = os.getenv("GITHUB_REPO")
-GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
 
-if not TOKEN or not DB_URL or not GITHUB_REPO or not GITHUB_TOKEN:
+if not TOKEN or not DB_URL:
     raise ValueError("Отсутствуют необходимые переменные окружения")
 
 bot = telebot.TeleBot(TOKEN)
+conn = psycopg2.connect(DB_URL, sslmode="require")
 
-# Создание таблиц
-def init_db():
-    conn = psycopg2.connect(DB_URL, sslmode="require")
-    with conn:
-        with conn.cursor() as cursor:
-            cursor.execute("""
-            CREATE TABLE IF NOT EXISTS supervisors (
-                id SERIAL PRIMARY KEY,
-                telegram_id BIGINT UNIQUE,
-                username TEXT UNIQUE,
-                password TEXT
-            );
-            """)
-            cursor.execute("""
-            CREATE TABLE IF NOT EXISTS products (
-                id SERIAL PRIMARY KEY,
-                supervisor_id INT REFERENCES supervisors(id) ON DELETE CASCADE,
-                barcode TEXT,
-                name TEXT,
-                price FLOAT,
-                image_url TEXT
-            );
-            """)
-            cursor.execute("""
-            CREATE TABLE IF NOT EXISTS orders (
-                id SERIAL PRIMARY KEY,
-                supervisor_id INT REFERENCES supervisors(id) ON DELETE CASCADE,
-                shop_name TEXT,
-                products JSONB
-            );
-            """)
-    conn.close()
+# Инициализация БД
+with conn:
+    with conn.cursor() as cursor:
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS supervisors (
+            id SERIAL PRIMARY KEY,
+            telegram_id BIGINT UNIQUE,
+            username TEXT UNIQUE,
+            password TEXT
+        );
+        """)
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS products (
+            id SERIAL PRIMARY KEY,
+            supervisor_id INT REFERENCES supervisors(id) ON DELETE CASCADE,
+            barcode TEXT,
+            name TEXT,
+            price FLOAT
+        );
+        """)
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS orders (
+            id SERIAL PRIMARY KEY,
+            supervisor_id INT REFERENCES supervisors(id) ON DELETE CASCADE,
+            shop_name TEXT,
+            products JSONB
+        );
+        """)
+        conn.commit()
 
-init_db()
-
-# Авторизация
-supervisors = {}
+# Авторизованные пользователи
+authorized_users = {}
 
 def is_authorized(user_id):
-    return user_id in supervisors
+    return user_id in authorized_users
 
 def authorize(user_id, username, password):
-    conn = psycopg2.connect(DB_URL, sslmode="require")  # Открываем новое соединение
-    cursor = conn.cursor()
-    cursor.execute("SELECT id FROM supervisors WHERE username = %s AND password = %s", (username, password))
-    supervisor = cursor.fetchone()
-    cursor.close()
-    conn.close()
-
-    if supervisor:
-        supervisors[user_id] = supervisor[0]
-        return True
+    with conn.cursor() as cursor:
+        cursor.execute("SELECT id FROM supervisors WHERE username = %s AND password = %s", (username, password))
+        supervisor = cursor.fetchone()
+        if supervisor:
+            authorized_users[user_id] = supervisor[0]
+            return True
     return False
 
 @bot.message_handler(commands=['start'])
@@ -88,8 +78,7 @@ def login(message):
 # Главное меню
 def main_menu():
     markup = ReplyKeyboardMarkup(resize_keyboard=True)
-    markup.add(KeyboardButton("Добавить товар"))
-    markup.add(KeyboardButton("Создать заказ"))
+    markup.add(KeyboardButton("Добавить товар"), KeyboardButton("Создать заказ"))
     return markup
 
 # Добавление товаров
@@ -105,17 +94,15 @@ def process_product(message):
     try:
         barcode, name, price = message.text.split(",")
         price = float(price)
-        conn = psycopg2.connect(DB_URL, sslmode="require")
-        cursor = conn.cursor()
-        cursor.execute("""
-        INSERT INTO products (supervisor_id, barcode, name, price) 
-        VALUES (%s, %s, %s, %s)
-        """, (supervisors[message.chat.id], barcode.strip(), name.strip(), price))
-        conn.commit()
-        cursor.close()
-        conn.close()
+        with conn.cursor() as cursor:
+            cursor.execute("""
+            INSERT INTO products (supervisor_id, barcode, name, price) 
+            VALUES (%s, %s, %s, %s)
+            """, (authorized_users[message.chat.id], barcode.strip(), name.strip(), price))
+            conn.commit()
         bot.send_message(message.chat.id, "✅ Товар добавлен!", reply_markup=main_menu())
-    except:
+    except Exception as e:
+        logging.error(f"Ошибка при добавлении товара: {e}")
         bot.send_message(message.chat.id, "❌ Ошибка ввода!")
 
 # Создание заказа
@@ -138,17 +125,18 @@ def save_order(message, shop_name):
         for item in message.text.split(","):
             barcode, quantity = item.split(":")
             order_data.append({"barcode": barcode.strip(), "quantity": int(quantity)})
-        conn = psycopg2.connect(DB_URL, sslmode="require")
-        cursor = conn.cursor()
-        cursor.execute("""
-        INSERT INTO orders (supervisor_id, shop_name, products) VALUES (%s, %s, %s)
-        """, (supervisors[message.chat.id], shop_name, json.dumps(order_data)))
-        conn.commit()
-        cursor.close()
-        conn.close()
+        with conn.cursor() as cursor:
+            cursor.execute("""
+            INSERT INTO orders (supervisor_id, shop_name, products) VALUES (%s, %s, %s)
+            """, (authorized_users[message.chat.id], shop_name, json.dumps(order_data)))
+            conn.commit()
         bot.send_message(message.chat.id, "✅ Заказ сохранен!", reply_markup=main_menu())
-    except:
+    except Exception as e:
+        logging.error(f"Ошибка при создании заказа: {e}")
         bot.send_message(message.chat.id, "❌ Ошибка ввода!")
 
-# Запуск
-bot.polling(none_stop=True, skip_pending=True)
+# Запуск polling
+try:
+    bot.polling(none_stop=True, skip_pending=True)
+finally:
+    conn.close()
