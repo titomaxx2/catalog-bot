@@ -356,7 +356,7 @@ def process_order_name(message):
         }
         
         markup = ReplyKeyboardMarkup(resize_keyboard=True)
-        markup.add(KeyboardButton("🔍 Поиск по штрихкоду"))
+        markup.add(KeyboardButton("🔍 Сканировать штрихкод"))
         markup.add(KeyboardButton("⌨️ Ввести 4 цифры"))
         markup.add(KeyboardButton("🔙 Назад"))
         
@@ -371,7 +371,7 @@ def process_order_name(message):
 def handle_order_action(message):
     order_id = user_states[message.chat.id]['order_id']
     
-    if message.text == "🔍 Поиск по штрихкоду":
+    if message.text == "🔍 Сканировать штрихкод":
         user_states[message.chat.id] = {'step': 'awaiting_barcode_scan', 'order_id': order_id}
         bot.send_message(message.chat.id, "📷 Отправьте фото штрихкода")
         
@@ -437,6 +437,7 @@ def list_orders(message):
                 message.chat.id,
                 f"📋 {name}\n🕒 {created_at.strftime('%Y-%m-%d %H:%M')}",
                 reply_markup=order_menu(order_id)
+            )
                 
     except Exception as e:
         logger.error(f"Ошибка списка заявок: {e}")
@@ -470,6 +471,7 @@ def handle_order_callback(call):
                         "JOIN products p ON oi.product_id = p.id "
                         "WHERE oi.order_id = %s",
                         (order_id,)
+                    )
                     items = cursor.fetchall()
             
             wb = Workbook()
@@ -502,6 +504,7 @@ def handle_edit_order(message):
                     "JOIN products p ON oi.product_id = p.id "
                     "WHERE oi.order_id = %s",
                     (order_id,)
+                )
                 items = cursor.fetchall()
         
         if not items:
