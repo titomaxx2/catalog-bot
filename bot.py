@@ -2,7 +2,7 @@ import os
 import logging
 import time
 import requests
-import psycopg2
+import psycopg2.pool
 import telebot
 from flask import Flask
 from PIL import Image, ImageEnhance, ImageOps
@@ -26,10 +26,20 @@ logger = logging.getLogger(__name__)
 # Инициализация бота
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 bot = telebot.TeleBot(TOKEN, num_threads=5)
+
+# Конфигурация БД
 DB_URL = os.getenv("DATABASE_URL")
 OCR_API_KEY = os.getenv("OCR_API_KEY")
 MAX_IMAGE_SIZE_MB = 1
 user_states = {}
+
+# Пул соединений
+connection_pool = psycopg2.pool.ThreadedConnectionPool(
+    minconn=1,
+    maxconn=10,
+    dsn=DB_URL,
+    sslmode="require"
+)
 
 # Инициализация БД
 def init_db():
@@ -63,9 +73,9 @@ def init_db():
         )
         """
     )
-    conn = None
+    
+    conn = connection_pool.getconn()
     try:
-        conn = psycopg2.connect(DB_URL, sslmode="require")
         with conn.cursor() as cursor:
             for command in commands:
                 cursor.execute(command)
@@ -73,12 +83,10 @@ def init_db():
         logger.info("Таблицы БД успешно созданы")
     except Exception as e:
         logger.error(f"Ошибка инициализации БД: {e}")
-        if conn:
-            conn.rollback()
+        conn.rollback()
         raise
     finally:
-        if conn:
-            conn.close()
+        connection_pool.putconn(conn)
 
 init_db()
 
@@ -89,20 +97,21 @@ app = Flask(__name__)
 def home():
     return "Telegram Bot is Running"
 
-class DBConnection:
+class DBCursor:
     def __init__(self):
-        self.conn = psycopg2.connect(DB_URL, sslmode="require")
+        self.conn = connection_pool.getconn()
+        self.cursor = self.conn.cursor()
         
     def __enter__(self):
-        return self.conn.cursor()
+        return self.cursor
     
     def __exit__(self, exc_type, exc_val, exc_tb):
-        if self.conn:
-            if exc_type is None:
-                self.conn.commit()
-            else:
-                self.conn.rollback()
-            self.conn.close()
+        if exc_type is None:
+            self.conn.commit()
+        else:
+            self.conn.rollback()
+        self.cursor.close()
+        connection_pool.putconn(self.conn)
 
 def compress_image(image_data: bytes) -> bytes:
     if len(image_data) <= MAX_IMAGE_SIZE_MB * 1024 * 1024:
@@ -110,12 +119,12 @@ def compress_image(image_data: bytes) -> bytes:
 
     try:
         with Image.open(BytesIO(image_data)) as img:
+            img = ImageOps.exif_transpose(img)
             if img.mode != 'RGB':
                 img = img.convert('RGB')
             
             output = BytesIO()
             quality = 85
-            img = ImageOps.exif_transpose(img)
             
             while quality >= 20:
                 output.seek(0)
@@ -132,49 +141,53 @@ def compress_image(image_data: bytes) -> bytes:
         logger.error(f"Ошибка сжатия: {e}")
         raise
 
-def preprocess_image(image_data: bytes) -> bytes:
+def process_barcode_image(image_data: bytes) -> str:
     try:
-        image = Image.open(BytesIO(image_data))
-        image = ImageEnhance.Contrast(image).enhance(2.0)
-        image = image.convert('L')
-        image = ImageOps.exif_transpose(image)
+        processed_image = preprocess_image(image_data)
+        compressed_image = compress_image(processed_image)
+
+        for attempt in range(3):
+            try:
+                response = requests.post(
+                    'https://api.ocr.space/parse/image',
+                    files={'image': ('barcode.jpg', compressed_image, 'image/jpeg')},
+                    data={'apikey': OCR_API_KEY, 'OCREngine': 2, 'isTable': 'true'},
+                    timeout=20
+                )
+                response.raise_for_status()
+                
+                result = response.json()
+                parsed_text = result['ParsedResults'][0]['ParsedText']
+                numbers = [word.strip() for word in parsed_text.split() if word.strip().isdigit()]
+                valid_barcodes = [num for num in numbers if 8 <= len(num) <= 15]
+                
+                if valid_barcodes:
+                    return max(valid_barcodes, key=len)
+                
+            except Exception as e:
+                logger.warning(f"Попытка {attempt+1} ошибка: {e}")
+                time.sleep(2)
         
-        output = BytesIO()
-        image.save(output, format='JPEG', quality=85)
-        return output.getvalue()
+        return None
     except Exception as e:
-        logger.error(f"Ошибка обработки изображения: {e}")
-        raise
+        logger.error(f"Ошибка OCR: {e}")
+        return None
 
-# Клавиатуры
 def main_menu():
-    markup = ReplyKeyboardMarkup(resize_keyboard=True)
-    markup.add("➕ Добавить товар", "📦 Каталог")
-    markup.add("📷 Сканировать штрихкод", "📤 Экспорт")
-    markup.add("📝 Создать заявку", "📋 Список заявок")
-    return markup
-
-def catalog_menu(product_id: int):
-    markup = InlineKeyboardMarkup()
-    markup.row(
-        InlineKeyboardButton("✏️ Редактировать", callback_data=f"edit_{product_id}"),
-        InlineKeyboardButton("❌ Удалить", callback_data=f"delete_{product_id}")
-    )
-    return markup
-
-def order_menu(order_id: int):
-    markup = InlineKeyboardMarkup()
-    markup.row(
-        InlineKeyboardButton("✏️ Редактировать", callback_data=f"edit_order:{order_id}"),
-        InlineKeyboardButton("📤 Выгрузить", callback_data=f"export_order:{order_id}"),
-        InlineKeyboardButton("❌ Удалить", callback_data=f"delete_order:{order_id}")
+    markup = ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
+    markup.add(
+        KeyboardButton("➕ Добавить товар"),
+        KeyboardButton("📦 Каталог"),
+        KeyboardButton("📷 Сканировать"),
+        KeyboardButton("📝 Заявки"),
+        KeyboardButton("📤 Экспорт данных")
     )
     return markup
 
 @bot.message_handler(commands=['start'])
 def handle_start(message):
     try:
-        bot.send_message(message.chat.id, "🏪 Добро пожаловать!", reply_markup=main_menu())
+        bot.send_message(message.chat.id, "🏪 Добро пожаловать в Inventory Bot!", reply_markup=main_menu())
     except Exception as e:
         logger.error(f"Ошибка в /start: {e}")
 
@@ -188,7 +201,7 @@ def process_product_data(message):
     try:
         data = [x.strip() for x in message.text.split('|')]
         if len(data) != 3:
-            raise ValueError("Неверный формат")
+            raise ValueError("Неверный формат данных")
         
         barcode, name, price = data
         if not barcode.isdigit():
@@ -198,7 +211,7 @@ def process_product_data(message):
         if price <= 0:
             raise ValueError("Цена должна быть больше нуля")
 
-        with DBConnection() as cursor:
+        with DBCursor() as cursor:
             cursor.execute(
                 "INSERT INTO products (telegram_id, barcode, name, price) VALUES (%s, %s, %s, %s)",
                 (message.chat.id, barcode, name, price)
@@ -208,120 +221,84 @@ def process_product_data(message):
             'step': 'awaiting_product_image',
             'barcode': barcode
         }
-        bot.send_message(message.chat.id, "📷 Отправьте фото товара")
+        bot.send_message(message.chat.id, "✅ Данные сохранены! Теперь отправьте фото товара")
         
     except psycopg2.errors.UniqueViolation:
-        bot.send_message(message.chat.id, "❌ Штрихкод уже существует!")
+        bot.send_message(message.chat.id, "❌ Товар с таким штрихкодом уже существует!")
         del user_states[message.chat.id]
     except ValueError as e:
         bot.send_message(message.chat.id, f"❌ Ошибка: {e}")
         del user_states[message.chat.id]
     except Exception as e:
         logger.error(f"Ошибка добавления товара: {e}")
-        bot.send_message(message.chat.id, "❌ Ошибка сохранения!")
+        bot.send_message(message.chat.id, "❌ Ошибка сохранения данных!")
         del user_states[message.chat.id]
 
 @bot.message_handler(content_types=['photo'], func=lambda m: user_states.get(m.chat.id, {}).get('step') == 'awaiting_product_image')
-def process_product_image(message):
+def save_product_image(message):
     try:
         image_id = message.photo[-1].file_id
         barcode = user_states[message.chat.id]['barcode']
 
-        with DBConnection() as cursor:
+        with DBCursor() as cursor:
             cursor.execute(
                 "UPDATE products SET image_id = %s WHERE barcode = %s AND telegram_id = %s",
                 (image_id, barcode, message.chat.id)
             )
             if cursor.rowcount == 0:
-                raise ValueError("Товар не найден")
+                raise ValueError("Товар не найден в базе данных")
 
-        bot.send_message(message.chat.id, "✅ Товар добавлен!", reply_markup=main_menu())
+        bot.send_message(message.chat.id, "✅ Фото товара успешно сохранено!", reply_markup=main_menu())
     except Exception as e:
         logger.error(f"Ошибка сохранения фото: {e}")
         bot.send_message(message.chat.id, "❌ Ошибка сохранения фото!")
     finally:
         user_states.pop(message.chat.id, None)
 
-@bot.message_handler(func=lambda m: m.text == "📦 Каталог")
-def show_catalog(message):
+@bot.message_handler(func=lambda m: m.text == "📤 Экспорт данных")
+def handle_export(message):
     try:
-        with DBConnection() as cursor:
+        with DBCursor() as cursor:
             cursor.execute(
-                "SELECT id, barcode, name, price, image_id FROM products WHERE telegram_id = %s",
+                "SELECT barcode, name, price FROM products WHERE telegram_id = %s",
                 (message.chat.id,)
             )
             products = cursor.fetchall()
-        
-        if not products:
-            bot.send_message(message.chat.id, "🛒 Каталог пуст")
-            return
-        
-        for product in products:
-            product_id, barcode, name, price, image_id = product
-            caption = f"📦 {name}\n🔖 {barcode}\n💰 {price} руб."
-            reply_markup = catalog_menu(product_id)
-            
-            if image_id:
-                bot.send_photo(message.chat.id, image_id, caption=caption, reply_markup=reply_markup)
-            else:
-                bot.send_message(message.chat.id, caption, reply_markup=reply_markup)
-                
-    except Exception as e:
-        logger.error(f"Ошибка каталога: {e}")
-        bot.send_message(message.chat.id, "❌ Ошибка загрузки")
 
-@bot.callback_query_handler(func=lambda call: call.data.startswith(('edit_', 'delete_')))
-def handle_product_callback(call):
-    try:
-        action, product_id = call.data.split('_')
-        product_id = int(product_id)
-        
-        if action == 'edit':
-            msg = bot.send_message(call.message.chat.id, "Введите новое название и цену в формате:\nНазвание | Цена")
-            bot.register_next_step_handler(msg, process_edit_product, product_id)
-            
-        elif action == 'delete':
-            with DBConnection() as cursor:
-                cursor.execute(
-                    "DELETE FROM products WHERE id = %s AND telegram_id = %s",
-                    (product_id, call.message.chat.id)
-                )
-                if cursor.rowcount > 0:
-                    bot.answer_callback_query(call.id, "✅ Товар удален")
-                    bot.delete_message(call.message.chat.id, call.message.message_id)
-                else:
-                    bot.answer_callback_query(call.id, "❌ Товар не найден")
-                    
-    except Exception as e:
-        logger.error(f"Ошибка обработки товара: {e}")
-        bot.answer_callback_query(call.id, "❌ Ошибка обработки")
-
-def process_edit_product(message, product_id):
-    try:
-        data = [x.strip() for x in message.text.split('|')]
-        if len(data) != 2:
-            raise ValueError("Неверный формат")
-        
-        name, price = data
-        price = float(price)
-        if price <= 0:
-            raise ValueError("Цена должна быть больше нуля")
-
-        with DBConnection() as cursor:
             cursor.execute(
-                "UPDATE products SET name = %s, price = %s WHERE id = %s AND telegram_id = %s",
-                (name, price, product_id, message.chat.id)
+                "SELECT o.id, o.name, COUNT(oi.id) FROM orders o "
+                "LEFT JOIN order_items oi ON o.id = oi.order_id "
+                "WHERE o.telegram_id = %s GROUP BY o.id",
+                (message.chat.id,)
             )
-            if cursor.rowcount == 0:
-                raise ValueError("Товар не найден")
-            
-        bot.send_message(message.chat.id, "✅ Товар обновлен!", reply_markup=main_menu())
+            orders = cursor.fetchall()
+
+        wb = Workbook()
+        
+        ws_products = wb.active
+        ws_products.title = "Товары"
+        ws_products.append(["Штрихкод", "Название", "Цена"])
+        for product in products:
+            ws_products.append(product)
+        
+        ws_orders = wb.create_sheet("Заявки")
+        ws_orders.append(["ID", "Название заявки", "Количество товаров"])
+        for order in orders:
+            ws_orders.append(order)
+        
+        filename = f"export_{message.chat.id}.xlsx"
+        wb.save(filename)
+        
+        with open(filename, 'rb') as f:
+            bot.send_document(message.chat.id, f, caption="📤 Ваши данные для экспорта")
+        
+        os.remove(filename)
+        
     except Exception as e:
-        logger.error(f"Ошибка обновления товара: {e}")
-        bot.send_message(message.chat.id, f"❌ Ошибка: {e}")
+        logger.error(f"Ошибка экспорта: {e}")
+        bot.send_message(message.chat.id, "❌ Ошибка при экспорте данных!")
 
-# Остальные обработчики для заявок и экспорта остаются аналогичными, но с использованием DBConnection
-
+# Запуск приложения
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
     Thread(target=app.run, kwargs={
@@ -337,4 +314,4 @@ if __name__ == "__main__":
             bot.infinity_polling()
         except Exception as e:
             logger.error(f"Ошибка подключения: {e}")
-            time.sleep(10)
+            time.sleep(15)
