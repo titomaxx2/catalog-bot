@@ -4,7 +4,6 @@ import time
 import requests
 import psycopg2
 import telebot
-import json
 from flask import Flask
 from PIL import Image, ImageEnhance
 from io import BytesIO
@@ -329,7 +328,7 @@ def process_barcode_scan(message):
     finally:
         user_states.pop(message.chat.id, None)
 
-# ... (остальной код остается без изменений)
+# ... (остальные функции без изменений)
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
