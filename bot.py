@@ -48,6 +48,23 @@ def init_db():
             created_at TIMESTAMP DEFAULT NOW()
         )
         """,
+        """
+        CREATE TABLE IF NOT EXISTS orders (
+            id SERIAL PRIMARY KEY,
+            telegram_id BIGINT NOT NULL,
+            name TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT NOW()
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS order_items (
+            id SERIAL PRIMARY KEY,
+            order_id INT NOT NULL REFERENCES orders(id) ON DELETE CASCADE,
+            product_id INT NOT NULL REFERENCES products(id) ON DELETE CASCADE,
+            quantity INT NOT NULL DEFAULT 1,
+            created_at TIMESTAMP DEFAULT NOW()
+        )
+        """
     )
     try:
         conn = psycopg2.connect(DB_URL, sslmode="require")
@@ -131,6 +148,7 @@ def main_menu():
     markup.add(KeyboardButton("➕ Добавить товар"))
     markup.add(KeyboardButton("📦 Каталог"), KeyboardButton("📤 Экспорт"))
     markup.add(KeyboardButton("📷 Сканировать штрихкод"))
+    markup.add(KeyboardButton("📝 Создать заявку"), KeyboardButton("📋 Список заявок"))
     return markup
 
 def catalog_menu(product_id: int):
@@ -138,6 +156,14 @@ def catalog_menu(product_id: int):
     markup.row(
         InlineKeyboardButton("✏️ Редактировать", callback_data=f"edit_{product_id}"),
         InlineKeyboardButton("❌ Удалить", callback_data=f"delete_{product_id}")
+    )
+    return markup
+
+def order_menu(order_id: int):
+    markup = InlineKeyboardMarkup()
+    markup.row(
+        InlineKeyboardButton("📦 Просмотреть", callback_data=f"view_order_{order_id}"),
+        InlineKeyboardButton("📤 Выгрузить в Excel", callback_data=f"export_order_{order_id}")
     )
     return markup
 
@@ -246,104 +272,6 @@ def show_catalog(message):
     except Exception as e:
         logger.error(f"Ошибка показа каталога: {e}")
         bot.send_message(message.chat.id, "❌ Ошибка загрузки каталога")
-
-@bot.callback_query_handler(func=lambda call: call.data.startswith(('edit_', 'delete_')))
-def handle_callback(call):
-    try:
-        action, product_id = call.data.split('_')
-        product_id = int(product_id)
-        
-        if action == 'edit':
-            user_states[call.message.chat.id] = {
-                'step': 'edit_product',
-                'product_id': product_id
-            }
-            bot.send_message(
-                call.message.chat.id,
-                "✏️ Введите новую цену для товара:"
-            )
-            
-        elif action == 'delete':
-            with psycopg2.connect(DB_URL, sslmode="require") as conn:
-                with conn.cursor() as cursor:
-                    cursor.execute(
-                        "DELETE FROM products WHERE id = %s AND telegram_id = %s",
-                        (product_id, call.message.chat.id)
-                    )
-                    conn.commit()
-            bot.send_message(
-                call.message.chat.id,
-                "✅ Товар успешно удален!",
-                reply_markup=main_menu()
-            )
-            
-    except Exception as e:
-        logger.error(f"Ошибка обработки callback: {e}")
-        bot.send_message(call.message.chat.id, "❌ Произошла ошибка при обработке запроса")
-
-@bot.message_handler(func=lambda m: user_states.get(m.chat.id, {}).get('step') == 'edit_product')
-def handle_edit_price(message):
-    try:
-        product_id = user_states[message.chat.id]['product_id']
-        new_price = float(message.text)
-        
-        with psycopg2.connect(DB_URL, sslmode="require") as conn:
-            with conn.cursor() as cursor:
-                cursor.execute(
-                    "UPDATE products SET price = %s WHERE id = %s AND telegram_id = %s",
-                    (new_price, product_id, message.chat.id)
-                )
-                conn.commit()
-                
-        bot.send_message(
-            message.chat.id,
-            "✅ Цена товара успешно обновлена!",
-            reply_markup=main_menu()
-        )
-        
-    except ValueError:
-        bot.send_message(message.chat.id, "❌ Введите корректное числовое значение цены")
-    except Exception as e:
-        logger.error(f"Ошибка обновления цены: {e}")
-        bot.send_message(message.chat.id, "❌ Ошибка при обновлении цены")
-    finally:
-        user_states.pop(message.chat.id, None)
-
-@bot.message_handler(func=lambda m: m.text == "📤 Экспорт")
-def handle_export(message):
-    try:
-        with psycopg2.connect(DB_URL, sslmode="require") as conn:
-            with conn.cursor() as cursor:
-                cursor.execute(
-                    "SELECT barcode, name, price, created_at FROM products WHERE telegram_id = %s",
-                    (message.chat.id,)
-                )
-                products = cursor.fetchall()
-        
-        wb = Workbook()
-        ws = wb.active
-        ws.title = "Каталог товаров"
-        ws.append(["Штрихкод", "Название", "Цена", "Дата добавления"])
-        
-        for product in products:
-            barcode, name, price, created_at = product
-            ws.append([barcode, name, price, created_at.strftime("%Y-%m-%d %H:%M")])
-        
-        filename = f"catalog_{message.chat.id}.xlsx"
-        wb.save(filename)
-        
-        with open(filename, "rb") as f:
-            bot.send_document(
-                message.chat.id,
-                f,
-                caption="📤 Ваш каталог товаров в формате Excel"
-            )
-        
-        os.remove(filename)
-        
-    except Exception as e:
-        logger.error(f"Ошибка экспорта: {e}")
-        bot.send_message(message.chat.id, "❌ Ошибка при экспорте данных")
 
 @bot.message_handler(func=lambda m: m.text == "📷 Сканировать штрихкод")
 def handle_scan(message):
@@ -459,6 +387,184 @@ def process_barcode_scan(message):
         )
     finally:
         user_states.pop(message.chat.id, None)
+
+@bot.message_handler(func=lambda m: m.text == "📝 Создать заявку")
+def create_order(message):
+    try:
+        user_states[message.chat.id] = {'step': 'awaiting_order_name'}
+        bot.send_message(
+            message.chat.id,
+            "📝 Введите название заявки:"
+        )
+    except Exception as e:
+        logger.error(f"Ошибка создания заявки: {e}")
+
+@bot.message_handler(func=lambda m: user_states.get(m.chat.id, {}).get('step') == 'awaiting_order_name')
+def process_order_name(message):
+    try:
+        order_name = message.text.strip()
+        if not order_name:
+            raise ValueError("Название заявки не может быть пустым")
+        
+        with psycopg2.connect(DB_URL, sslmode="require") as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    "INSERT INTO orders (telegram_id, name) VALUES (%s, %s) RETURNING id",
+                    (message.chat.id, order_name)
+                )
+                order_id = cursor.fetchone()[0]
+                conn.commit()
+        
+        user_states[message.chat.id] = {
+            'step': 'awaiting_order_barcode',
+            'order_id': order_id
+        }
+        bot.send_message(
+            message.chat.id,
+            "📦 Введите последние 4 цифры штрихкода товара для добавления в заявку:"
+        )
+        
+    except Exception as e:
+        logger.error(f"Ошибка обработки названия заявки: {e}")
+        bot.send_message(message.chat.id, "❌ Ошибка: название заявки не может быть пустым")
+        del user_states[message.chat.id]
+
+@bot.message_handler(func=lambda m: user_states.get(m.chat.id, {}).get('step') == 'awaiting_order_barcode')
+def process_order_barcode(message):
+    try:
+        last_four_digits = message.text.strip()
+        if not last_four_digits.isdigit() or len(last_four_digits) != 4:
+            raise ValueError("Введите ровно 4 цифры")
+        
+        order_id = user_states[message.chat.id]['order_id']
+        
+        with psycopg2.connect(DB_URL, sslmode="require") as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    "SELECT id, name, price FROM products WHERE telegram_id = %s AND barcode LIKE %s",
+                    (message.chat.id, f"%{last_four_digits}")
+                )
+                product = cursor.fetchone()
+                
+                if product:
+                    product_id, name, price = product
+                    cursor.execute(
+                        "INSERT INTO order_items (order_id, product_id) VALUES (%s, %s)",
+                        (order_id, product_id)
+                    )
+                    conn.commit()
+                    bot.send_message(
+                        message.chat.id,
+                        f"✅ Товар '{name}' добавлен в заявку!",
+                        reply_markup=main_menu()
+                    )
+                else:
+                    bot.send_message(
+                        message.chat.id,
+                        "❌ Товар не найден. Попробуйте еще раз.",
+                        reply_markup=main_menu()
+                    )
+        
+    except Exception as e:
+        logger.error(f"Ошибка обработки штрихкода: {e}")
+        bot.send_message(message.chat.id, "❌ Ошибка: введите ровно 4 цифры")
+    finally:
+        user_states.pop(message.chat.id, None)
+
+@bot.message_handler(func=lambda m: m.text == "📋 Список заявок")
+def list_orders(message):
+    try:
+        with psycopg2.connect(DB_URL, sslmode="require") as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    "SELECT id, name, created_at FROM orders WHERE telegram_id = %s ORDER BY created_at DESC",
+                    (message.chat.id,)
+                )
+                orders = cursor.fetchall()
+        
+        if not orders:
+            bot.send_message(message.chat.id, "📋 У вас нет заявок.")
+            return
+        
+        for order in orders:
+            order_id, name, created_at = order
+            bot.send_message(
+                message.chat.id,
+                f"📋 Заявка: {name}\n🕒 Дата создания: {created_at.strftime('%Y-%m-%d %H:%M')}",
+                reply_markup=order_menu(order_id)
+            )
+                
+    except Exception as e:
+        logger.error(f"Ошибка показа списка заявок: {e}")
+        bot.send_message(message.chat.id, "❌ Ошибка загрузки списка заявок")
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith(('view_order_', 'export_order_')))
+def handle_order_callback(call):
+    try:
+        action, order_id = call.data.split('_')
+        order_id = int(order_id)
+        
+        if action == 'view':
+            with psycopg2.connect(DB_URL, sslmode="require") as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute(
+                        "SELECT p.name, p.price, oi.quantity FROM order_items oi "
+                        "JOIN products p ON oi.product_id = p.id "
+                        "WHERE oi.order_id = %s",
+                        (order_id,)
+                    )
+                    items = cursor.fetchall()
+            
+            if not items:
+                bot.send_message(call.message.chat.id, "🛒 Заявка пуста.")
+                return
+            
+            response_text = "📦 Товары в заявке:\n"
+            for item in items:
+                name, price, quantity = item
+                response_text += f"📦 {name} - {price} руб. x {quantity}\n"
+            
+            bot.send_message(call.message.chat.id, response_text)
+            
+        elif action == 'export':
+            with psycopg2.connect(DB_URL, sslmode="require") as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute(
+                        "SELECT p.name, p.price, oi.quantity FROM order_items oi "
+                        "JOIN products p ON oi.product_id = p.id "
+                        "WHERE oi.order_id = %s",
+                        (order_id,)
+                    )
+                    items = cursor.fetchall()
+            
+            if not items:
+                bot.send_message(call.message.chat.id, "🛒 Заявка пуста.")
+                return
+            
+            wb = Workbook()
+            ws = wb.active
+            ws.title = "Заявка"
+            ws.append(["Название", "Цена", "Количество"])
+            
+            for item in items:
+                name, price, quantity = item
+                ws.append([name, price, quantity])
+            
+            filename = f"order_{order_id}.xlsx"
+            wb.save(filename)
+            
+            with open(filename, "rb") as f:
+                bot.send_document(
+                    call.message.chat.id,
+                    f,
+                    caption="📤 Ваша заявка в формате Excel"
+                )
+            
+            os.remove(filename)
+            
+    except Exception as e:
+        logger.error(f"Ошибка обработки callback: {e}")
+        bot.send_message(call.message.chat.id, "❌ Произошла ошибка при обработке запроса")
 
 if __name__ == "__main__":
     # Запуск Flask сервера
