@@ -2,10 +2,11 @@ import os
 import logging
 import time
 import requests
-import psycopg2.pool
+import psycopg2
 import telebot
+import json
 from flask import Flask
-from PIL import Image, ImageEnhance, ImageOps
+from PIL import Image, ImageEnhance
 from io import BytesIO
 from threading import Thread
 from openpyxl import Workbook
@@ -25,21 +26,13 @@ logger = logging.getLogger(__name__)
 
 # Инициализация бота
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-bot = telebot.TeleBot(TOKEN, num_threads=5)
+bot = telebot.TeleBot(TOKEN)
 
-# Конфигурация БД
+# Конфигурация
 DB_URL = os.getenv("DATABASE_URL")
 OCR_API_KEY = os.getenv("OCR_API_KEY")
 MAX_IMAGE_SIZE_MB = 1
 user_states = {}
-
-# Пул соединений
-connection_pool = psycopg2.pool.ThreadedConnectionPool(
-    minconn=1,
-    maxconn=10,
-    dsn=DB_URL,
-    sslmode="require"
-)
 
 # Инициализация БД
 def init_db():
@@ -50,32 +43,14 @@ def init_db():
             telegram_id BIGINT NOT NULL,
             barcode TEXT NOT NULL UNIQUE,
             name TEXT NOT NULL,
-            price FLOAT NOT NULL CHECK (price > 0),
+            price FLOAT NOT NULL,
             image_id TEXT,
             created_at TIMESTAMP DEFAULT NOW()
         )
         """,
-        """
-        CREATE TABLE IF NOT EXISTS orders (
-            id SERIAL PRIMARY KEY,
-            telegram_id BIGINT NOT NULL,
-            name TEXT NOT NULL,
-            created_at TIMESTAMP DEFAULT NOW()
-        )
-        """,
-        """
-        CREATE TABLE IF NOT EXISTS order_items (
-            id SERIAL PRIMARY KEY,
-            order_id INT NOT NULL REFERENCES orders(id) ON DELETE CASCADE,
-            product_id INT NOT NULL REFERENCES products(id) ON DELETE CASCADE,
-            quantity INT NOT NULL DEFAULT 1,
-            created_at TIMESTAMP DEFAULT NOW()
-        )
-        """
     )
-    
-    conn = connection_pool.getconn()
     try:
+        conn = psycopg2.connect(DB_URL, sslmode="require")
         with conn.cursor() as cursor:
             for command in commands:
                 cursor.execute(command)
@@ -83,10 +58,7 @@ def init_db():
         logger.info("Таблицы БД успешно созданы")
     except Exception as e:
         logger.error(f"Ошибка инициализации БД: {e}")
-        conn.rollback()
         raise
-    finally:
-        connection_pool.putconn(conn)
 
 init_db()
 
@@ -97,36 +69,22 @@ app = Flask(__name__)
 def home():
     return "Telegram Bot is Running"
 
-class DBCursor:
-    def __init__(self):
-        self.conn = connection_pool.getconn()
-        self.cursor = self.conn.cursor()
-        
-    def __enter__(self):
-        return self.cursor
-    
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        if exc_type is None:
-            self.conn.commit()
-        else:
-            self.conn.rollback()
-        self.cursor.close()
-        connection_pool.putconn(self.conn)
-
 def compress_image(image_data: bytes) -> bytes:
+    """Сжимает изображение только если размер превышает 1 МБ"""
     if len(image_data) <= MAX_IMAGE_SIZE_MB * 1024 * 1024:
+        logger.info("Изображение не требует сжатия")
         return image_data
 
     try:
         with Image.open(BytesIO(image_data)) as img:
-            img = ImageOps.exif_transpose(img)
             if img.mode != 'RGB':
                 img = img.convert('RGB')
             
+            # Сохраняем изображение с уменьшенным качеством
             output = BytesIO()
             quality = 85
             
-            while quality >= 20:
+            while True:
                 output.seek(0)
                 output.truncate()
                 img.save(output, format='JPEG', quality=quality, optimize=True)
@@ -134,67 +92,77 @@ def compress_image(image_data: bytes) -> bytes:
                     break
                 quality -= 5
                 if quality < 50:
-                    img = img.resize((int(img.width*0.9), int(img.height*0.9)))
+                    break
             
+            logger.info(f"Изображение сжато до {len(output.getvalue())//1024} KB")
             return output.getvalue()
     except Exception as e:
         logger.error(f"Ошибка сжатия: {e}")
         raise
 
-def process_barcode_image(image_data: bytes) -> str:
+def preprocess_image(image_data: bytes) -> bytes:
+    """
+    Предварительная обработка изображения для улучшения распознавания.
+    """
     try:
-        processed_image = preprocess_image(image_data)
-        compressed_image = compress_image(processed_image)
-
-        for attempt in range(3):
-            try:
-                response = requests.post(
-                    'https://api.ocr.space/parse/image',
-                    files={'image': ('barcode.jpg', compressed_image, 'image/jpeg')},
-                    data={'apikey': OCR_API_KEY, 'OCREngine': 2, 'isTable': 'true'},
-                    timeout=20
-                )
-                response.raise_for_status()
-                
-                result = response.json()
-                parsed_text = result['ParsedResults'][0]['ParsedText']
-                numbers = [word.strip() for word in parsed_text.split() if word.strip().isdigit()]
-                valid_barcodes = [num for num in numbers if 8 <= len(num) <= 15]
-                
-                if valid_barcodes:
-                    return max(valid_barcodes, key=len)
-                
-            except Exception as e:
-                logger.warning(f"Попытка {attempt+1} ошибка: {e}")
-                time.sleep(2)
+        # Открываем изображение с помощью Pillow
+        image = Image.open(BytesIO(image_data))
         
-        return None
+        # Увеличение контрастности
+        enhancer = ImageEnhance.Contrast(image)
+        image = enhancer.enhance(2.0)  # Увеличиваем контрастность в 2 раза
+        
+        # Преобразуем изображение в grayscale
+        image = image.convert('L')
+        
+        # Сохраняем изображение в BytesIO
+        output = BytesIO()
+        image.save(output, format='JPEG', quality=85)
+        output.seek(0)
+        
+        return output.getvalue()
     except Exception as e:
-        logger.error(f"Ошибка OCR: {e}")
-        return None
+        logger.error(f"Ошибка обработки изображения: {e}")
+        raise
 
+# Клавиатуры
 def main_menu():
-    markup = ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
-    markup.add(
-        KeyboardButton("➕ Добавить товар"),
-        KeyboardButton("📦 Каталог"),
-        KeyboardButton("📷 Сканировать"),
-        KeyboardButton("📝 Заявки"),
-        KeyboardButton("📤 Экспорт данных")
+    markup = ReplyKeyboardMarkup(resize_keyboard=True)
+    markup.add(KeyboardButton("➕ Добавить товар"))
+    markup.add(KeyboardButton("📦 Каталог"), KeyboardButton("📤 Экспорт"))
+    markup.add(KeyboardButton("📷 Сканировать штрихкод"))
+    return markup
+
+def catalog_menu(product_id: int):
+    markup = InlineKeyboardMarkup()
+    markup.row(
+        InlineKeyboardButton("✏️ Редактировать", callback_data=f"edit_{product_id}"),
+        InlineKeyboardButton("❌ Удалить", callback_data=f"delete_{product_id}")
     )
     return markup
 
 @bot.message_handler(commands=['start'])
 def handle_start(message):
     try:
-        bot.send_message(message.chat.id, "🏪 Добро пожаловать в Inventory Bot!", reply_markup=main_menu())
+        logger.info(f"Новый пользователь: {message.chat.id}")
+        bot.send_message(
+            message.chat.id,
+            "🏪 Добро пожаловать в систему управления товарами!",
+            reply_markup=main_menu()
+        )
     except Exception as e:
         logger.error(f"Ошибка в /start: {e}")
 
 @bot.message_handler(func=lambda m: m.text == "➕ Добавить товар")
 def start_add_product(message):
-    user_states[message.chat.id] = {'step': 'awaiting_product_data'}
-    bot.send_message(message.chat.id, "📝 Введите данные в формате:\nШтрихкод | Название | Цена")
+    try:
+        user_states[message.chat.id] = {'step': 'awaiting_product_data'}
+        bot.send_message(
+            message.chat.id,
+            "📝 Введите данные в формате:\nШтрихкод | Название | Цена\nПример: 46207657112 | Молоко 3.2% | 89.99"
+        )
+    except Exception as e:
+        logger.error(f"Ошибка начала добавления товара: {e}")
 
 @bot.message_handler(func=lambda m: user_states.get(m.chat.id, {}).get('step') == 'awaiting_product_data')
 def process_product_data(message):
@@ -204,102 +172,296 @@ def process_product_data(message):
             raise ValueError("Неверный формат данных")
         
         barcode, name, price = data
-        if not barcode.isdigit():
-            raise ValueError("Штрихкод должен содержать только цифры")
-        
         price = float(price)
-        if price <= 0:
-            raise ValueError("Цена должна быть больше нуля")
-
-        with DBCursor() as cursor:
-            cursor.execute(
-                "INSERT INTO products (telegram_id, barcode, name, price) VALUES (%s, %s, %s, %s)",
-                (message.chat.id, barcode, name, price)
-            )
         
         user_states[message.chat.id] = {
             'step': 'awaiting_product_image',
-            'barcode': barcode
+            'product_data': (barcode, name, price)
         }
-        bot.send_message(message.chat.id, "✅ Данные сохранены! Теперь отправьте фото товара")
+        bot.send_message(message.chat.id, "📷 Теперь отправьте фото товара")
         
-    except psycopg2.errors.UniqueViolation:
-        bot.send_message(message.chat.id, "❌ Товар с таким штрихкодом уже существует!")
-        del user_states[message.chat.id]
-    except ValueError as e:
-        bot.send_message(message.chat.id, f"❌ Ошибка: {e}")
-        del user_states[message.chat.id]
     except Exception as e:
-        logger.error(f"Ошибка добавления товара: {e}")
-        bot.send_message(message.chat.id, "❌ Ошибка сохранения данных!")
+        logger.error(f"Ошибка обработки данных: {e}")
+        bot.send_message(message.chat.id, "❌ Ошибка формата. Используйте правильный формат!")
         del user_states[message.chat.id]
 
 @bot.message_handler(content_types=['photo'], func=lambda m: user_states.get(m.chat.id, {}).get('step') == 'awaiting_product_image')
-def save_product_image(message):
+def process_product_image(message):
     try:
+        product_data = user_states[message.chat.id]['product_data']
         image_id = message.photo[-1].file_id
-        barcode = user_states[message.chat.id]['barcode']
-
-        with DBCursor() as cursor:
-            cursor.execute(
-                "UPDATE products SET image_id = %s WHERE barcode = %s AND telegram_id = %s",
-                (image_id, barcode, message.chat.id)
-            )
-            if cursor.rowcount == 0:
-                raise ValueError("Товар не найден в базе данных")
-
-        bot.send_message(message.chat.id, "✅ Фото товара успешно сохранено!", reply_markup=main_menu())
+        
+        with psycopg2.connect(DB_URL, sslmode="require") as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    "INSERT INTO products (telegram_id, barcode, name, price, image_id) VALUES (%s, %s, %s, %s, %s)",
+                    (message.chat.id, *product_data, image_id)
+                )
+                conn.commit()
+        
+        bot.send_message(message.chat.id, "✅ Товар успешно добавлен!", reply_markup=main_menu())
+        
+    except psycopg2.errors.UniqueViolation:
+        logger.error("Попытка добавить дубликат штрихкода")
+        bot.send_message(message.chat.id, "❌ Этот штрихкод уже существует!")
     except Exception as e:
-        logger.error(f"Ошибка сохранения фото: {e}")
-        bot.send_message(message.chat.id, "❌ Ошибка сохранения фото!")
+        logger.error(f"Ошибка сохранения товара: {e}")
+        bot.send_message(message.chat.id, "❌ Ошибка при сохранении товара!")
     finally:
         user_states.pop(message.chat.id, None)
 
-@bot.message_handler(func=lambda m: m.text == "📤 Экспорт данных")
+@bot.message_handler(func=lambda m: m.text == "📦 Каталог")
+def show_catalog(message):
+    try:
+        with psycopg2.connect(DB_URL, sslmode="require") as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    "SELECT id, barcode, name, price, image_id FROM products WHERE telegram_id = %s ORDER BY created_at DESC",
+                    (message.chat.id,)
+                )
+                products = cursor.fetchall()
+        
+        if not products:
+            bot.send_message(message.chat.id, "🛒 Ваш каталог товаров пуст")
+            return
+        
+        for product in products:
+            product_id, barcode, name, price, image_id = product
+            caption = f"📦 {name}\n🔖 Штрихкод: {barcode}\n💰 Цена: {price} руб."
+            
+            if image_id:
+                bot.send_photo(
+                    message.chat.id,
+                    image_id,
+                    caption=caption,
+                    reply_markup=catalog_menu(product_id)
+                )
+            else:
+                bot.send_message(
+                    message.chat.id,
+                    caption,
+                    reply_markup=catalog_menu(product_id)
+                )
+                
+    except Exception as e:
+        logger.error(f"Ошибка показа каталога: {e}")
+        bot.send_message(message.chat.id, "❌ Ошибка загрузки каталога")
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith(('edit_', 'delete_')))
+def handle_callback(call):
+    try:
+        action, product_id = call.data.split('_')
+        product_id = int(product_id)
+        
+        if action == 'edit':
+            user_states[call.message.chat.id] = {
+                'step': 'edit_product',
+                'product_id': product_id
+            }
+            bot.send_message(
+                call.message.chat.id,
+                "✏️ Введите новую цену для товара:"
+            )
+            
+        elif action == 'delete':
+            with psycopg2.connect(DB_URL, sslmode="require") as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute(
+                        "DELETE FROM products WHERE id = %s AND telegram_id = %s",
+                        (product_id, call.message.chat.id)
+                    )
+                    conn.commit()
+            bot.send_message(
+                call.message.chat.id,
+                "✅ Товар успешно удален!",
+                reply_markup=main_menu()
+            )
+            
+    except Exception as e:
+        logger.error(f"Ошибка обработки callback: {e}")
+        bot.send_message(call.message.chat.id, "❌ Произошла ошибка при обработке запроса")
+
+@bot.message_handler(func=lambda m: user_states.get(m.chat.id, {}).get('step') == 'edit_product')
+def handle_edit_price(message):
+    try:
+        product_id = user_states[message.chat.id]['product_id']
+        new_price = float(message.text)
+        
+        with psycopg2.connect(DB_URL, sslmode="require") as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    "UPDATE products SET price = %s WHERE id = %s AND telegram_id = %s",
+                    (new_price, product_id, message.chat.id)
+                )
+                conn.commit()
+                
+        bot.send_message(
+            message.chat.id,
+            "✅ Цена товара успешно обновлена!",
+            reply_markup=main_menu()
+        )
+        
+    except ValueError:
+        bot.send_message(message.chat.id, "❌ Введите корректное числовое значение цены")
+    except Exception as e:
+        logger.error(f"Ошибка обновления цены: {e}")
+        bot.send_message(message.chat.id, "❌ Ошибка при обновлении цены")
+    finally:
+        user_states.pop(message.chat.id, None)
+
+@bot.message_handler(func=lambda m: m.text == "📤 Экспорт")
 def handle_export(message):
     try:
-        with DBCursor() as cursor:
-            cursor.execute(
-                "SELECT barcode, name, price FROM products WHERE telegram_id = %s",
-                (message.chat.id,)
-            )
-            products = cursor.fetchall()
-
-            cursor.execute(
-                "SELECT o.id, o.name, COUNT(oi.id) FROM orders o "
-                "LEFT JOIN order_items oi ON o.id = oi.order_id "
-                "WHERE o.telegram_id = %s GROUP BY o.id",
-                (message.chat.id,)
-            )
-            orders = cursor.fetchall()
-
+        with psycopg2.connect(DB_URL, sslmode="require") as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    "SELECT barcode, name, price, created_at FROM products WHERE telegram_id = %s",
+                    (message.chat.id,)
+                )
+                products = cursor.fetchall()
+        
         wb = Workbook()
+        ws = wb.active
+        ws.title = "Каталог товаров"
+        ws.append(["Штрихкод", "Название", "Цена", "Дата добавления"])
         
-        ws_products = wb.active
-        ws_products.title = "Товары"
-        ws_products.append(["Штрихкод", "Название", "Цена"])
         for product in products:
-            ws_products.append(product)
+            barcode, name, price, created_at = product
+            ws.append([barcode, name, price, created_at.strftime("%Y-%m-%d %H:%M")])
         
-        ws_orders = wb.create_sheet("Заявки")
-        ws_orders.append(["ID", "Название заявки", "Количество товаров"])
-        for order in orders:
-            ws_orders.append(order)
-        
-        filename = f"export_{message.chat.id}.xlsx"
+        filename = f"catalog_{message.chat.id}.xlsx"
         wb.save(filename)
         
-        with open(filename, 'rb') as f:
-            bot.send_document(message.chat.id, f, caption="📤 Ваши данные для экспорта")
+        with open(filename, "rb") as f:
+            bot.send_document(
+                message.chat.id,
+                f,
+                caption="📤 Ваш каталог товаров в формате Excel"
+            )
         
         os.remove(filename)
         
     except Exception as e:
         logger.error(f"Ошибка экспорта: {e}")
-        bot.send_message(message.chat.id, "❌ Ошибка при экспорте данных!")
+        bot.send_message(message.chat.id, "❌ Ошибка при экспорте данных")
 
-# Запуск приложения
+@bot.message_handler(func=lambda m: m.text == "📷 Сканировать штрихкод")
+def handle_scan(message):
+    try:
+        user_states[message.chat.id] = {'step': 'awaiting_barcode_scan'}
+        bot.send_message(
+            message.chat.id,
+            "📷 Сфотографируйте штрихкод или отправьте изображение:",
+            reply_markup=ReplyKeyboardMarkup(resize_keyboard=True).add(KeyboardButton("Отмена"))
+        )
+    except Exception as e:
+        logger.error(f"Ошибка начала сканирования: {e}")
+
+@bot.message_handler(content_types=['photo'], func=lambda m: user_states.get(m.chat.id, {}).get('step') == 'awaiting_barcode_scan')
+def process_barcode_scan(message):
+    try:
+        # Скачивание изображения
+        file_info = bot.get_file(message.photo[-1].file_id)
+        downloaded_file = bot.download_file(file_info.file_path)
+        
+        # Предварительная обработка изображения
+        processed_image = preprocess_image(downloaded_file)
+        
+        # Сжатие изображения (если необходимо)
+        compressed_image = compress_image(processed_image)
+        logger.debug(f"Размер изображения для OCR: {len(compressed_image)} байт")
+
+        # Отправка в OCR API
+        max_retries = 3
+        retry_delay = 5  # Задержка между попытками в секундах
+        barcode = None
+
+        for attempt in range(max_retries):
+            try:
+                response = requests.post(
+                    'https://api.ocr.space/parse/image',
+                    files={'image': ('barcode.jpg', compressed_image, 'image/jpeg')},
+                    data={'apikey': OCR_API_KEY, 'OCREngine': 2},
+                    timeout=30
+                )
+                
+                # Обработка ответа
+                if response.status_code != 200:
+                    logger.error(f"HTTP Error {response.status_code}: {response.text}")
+                    raise Exception(f"HTTP Error {response.status_code}")
+                
+                result = response.json()
+                logger.info(f"Ответ OCR: {json.dumps(result, indent=2)}")  # Логируем полный ответ
+
+                # Проверка структуры ответа
+                if not result.get('ParsedResults'):
+                    logger.error("Некорректный ответ от OCR API: отсутствует ParsedResults")
+                    raise Exception("Некорректный ответ от OCR API")
+                
+                parsed_text = result['ParsedResults'][0].get('ParsedText', '')
+                logger.info(f"Распознанный текст: {parsed_text}")
+
+                # Удаляем символы новой строки и пробелы
+                cleaned_text = parsed_text.replace("\n", "").replace(" ", "")
+                logger.info(f"Очищенный текст: {cleaned_text}")
+
+                # Поиск штрихкода
+                numbers = [word.strip() for word in cleaned_text.split() if word.strip().isdigit()]
+                valid_barcodes = [num for num in numbers if 8 <= len(num) <= 15]
+                
+                if valid_barcodes:
+                    barcode = max(valid_barcodes, key=len)
+                    logger.info(f"Найден штрихкод: {barcode}")
+                    break  # Успешное распознавание, выходим из цикла
+                else:
+                    logger.warning(f"Попытка {attempt + 1}: Штрихкод не распознан")
+                    if attempt < max_retries - 1:
+                        time.sleep(retry_delay)
+            except Exception as e:
+                logger.error(f"Попытка {attempt + 1} не удалась: {e}")
+                if attempt < max_retries - 1:
+                    time.sleep(retry_delay)
+                else:
+                    raise  # Если все попытки исчерпаны, выбрасываем исключение
+
+        # Отправка результата
+        if barcode:
+            # Поиск в базе данных
+            with psycopg2.connect(DB_URL, sslmode="require") as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute(
+                        "SELECT name, price FROM products WHERE barcode = %s AND telegram_id = %s",
+                        (barcode, message.chat.id)
+                    )
+                    product = cursor.fetchone()
+            
+            response_text = f"✅ Штрихкод: `{barcode}`"
+            if product:
+                response_text += f"\n📦 Товар: {product[0]}\n💰 Цена: {product[1]} руб."
+            else:
+                response_text += "\n❌ Товар не найден в базе"
+        else:
+            response_text = "❌ Штрихкод не распознан\nПопробуйте сделать более четкое фото"
+
+        bot.send_message(
+            message.chat.id,
+            response_text,
+            parse_mode='Markdown',
+            reply_markup=main_menu()
+        )
+
+    except Exception as e:
+        logger.error(f"Ошибка сканирования: {str(e)}", exc_info=True)
+        bot.send_message(
+            message.chat.id,
+            f"⚠️ Ошибка: {str(e)}",
+            reply_markup=main_menu()
+        )
+    finally:
+        user_states.pop(message.chat.id, None)
+
 if __name__ == "__main__":
+    # Запуск Flask сервера
     port = int(os.environ.get("PORT", 10000))
     Thread(target=app.run, kwargs={
         'host': '0.0.0.0',
@@ -308,10 +470,11 @@ if __name__ == "__main__":
         'use_reloader': False
     }).start()
     
+    # Запуск бота
     logger.info("Бот запущен")
     while True:
         try:
-            bot.infinity_polling()
+            bot.polling(none_stop=True, interval=3, timeout=30)
         except Exception as e:
             logger.error(f"Ошибка подключения: {e}")
-            time.sleep(15)
+            time.sleep(10)
