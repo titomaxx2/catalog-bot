@@ -154,7 +154,8 @@ def order_menu(order_id: int):
     markup = InlineKeyboardMarkup()
     markup.row(
         InlineKeyboardButton("✏️ Редактировать", callback_data=f"edit_order:{order_id}"),
-        InlineKeyboardButton("📤 Выгрузить", callback_data=f"export_order:{order_id}")
+        InlineKeyboardButton("📤 Выгрузить", callback_data=f"export_order:{order_id}"),
+        InlineKeyboardButton("❌ Удалить", callback_data=f"delete_order:{order_id}")
     )
     return markup
 
@@ -303,7 +304,7 @@ def process_barcode_scan(message):
                             conn.commit()
                             bot.send_message(message.chat.id, "✅ Товар добавлен в заявку!", reply_markup=main_menu())
                         else:
-                            bot.send_message(message.chat.id, "❌ Товар не найден")
+                            bot.send_message(message.chat.id, f"❌ Товар с штрихкодом {barcode} не найден")
             else:
                 # Обычный поиск
                 with psycopg2.connect(DB_URL, sslmode="require") as conn:
@@ -317,7 +318,7 @@ def process_barcode_scan(message):
                 if product:
                     response_text = f"✅ Штрихкод: {barcode}\n📦 {product[0]}\n💰 {product[1]} руб."
                 else:
-                    response_text = "❌ Товар не найден"
+                    response_text = f"❌ Товар с штрихкодом {barcode} не найден"
         else:
             response_text = "❌ Штрихкод не распознан"
 
@@ -443,7 +444,7 @@ def list_orders(message):
         logger.error(f"Ошибка списка заявок: {e}")
         bot.send_message(message.chat.id, "❌ Ошибка загрузки")
 
-@bot.callback_query_handler(func=lambda call: call.data.startswith(('edit_order:', 'export_order:')))
+@bot.callback_query_handler(func=lambda call: call.data.startswith(('edit_order:', 'export_order:', 'delete_order:')))
 def handle_order_callback(call):
     try:
         action, order_id = call.data.split(':')
@@ -487,6 +488,17 @@ def handle_order_callback(call):
                 bot.send_document(call.message.chat.id, f, caption="📤 Ваша заявка")
             
             os.remove(filename)
+            
+        elif action == 'delete_order':
+            with psycopg2.connect(DB_URL, sslmode="require") as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute(
+                        "DELETE FROM orders WHERE id = %s",
+                        (order_id,)
+                    )
+                    conn.commit()
+            
+            bot.send_message(call.message.chat.id, "✅ Заявка удалена", reply_markup=main_menu())
             
     except Exception as e:
         logger.error(f"Ошибка callback: {e}")
