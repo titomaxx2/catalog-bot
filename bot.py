@@ -28,7 +28,7 @@ OCR_API_KEY = os.getenv("OCR_API_KEY")
 MAX_IMAGE_SIZE_MB = 2
 PORT = int(os.getenv("PORT", 5000))
 
-bot = telebot.TeleBot(TOKEN, num_threads=5)
+bot = telebot.TeleBot(TOKEN)
 user_states = {}
 state_lock = Lock()
 
@@ -145,8 +145,7 @@ def catalog_markup(product_id):
 def order_markup(order_id):
     return InlineKeyboardMarkup().row(
         InlineKeyboardButton("📤 Экспорт", callback_data=f"export_{order_id}"),
-        InlineKeyboardButton("❌ Удалить", callback_data=f"delord_{order_id}"),
-        InlineKeyboardButton("✏️ Редактировать", callback_data=f"editord_{order_id}")
+        InlineKeyboardButton("❌ Удалить", callback_data=f"delord_{order_id}")
     )
 
 def cleanup_states():
@@ -163,13 +162,13 @@ Thread(target=cleanup_states, daemon=True).start()
 # Обработчики товаров
 @bot.message_handler(commands=['start'])
 def start(message):
-    bot.send_message(message.chat.id, "🛒 Добро пожаловать в систему управления товарами!", reply_markup=main_menu())
+    bot.send_message(message.chat.id, "🛒 Добро пожаловать!", reply_markup=main_menu())
 
 @bot.message_handler(func=lambda m: m.text == "➕ Добавить товар")
 def add_product(message):
     with state_lock:
         user_states[message.chat.id] = {'step': 'await_product', 'time': time.time()}
-    bot.send_message(message.chat.id, "Введите данные в формате: Штрихкод | Название | Цена")
+    bot.send_message(message.chat.id, "Введите данные: Штрихкод | Название | Цена")
 
 @bot.message_handler(func=lambda m: user_states.get(m.chat.id, {}).get('step') == 'await_product')
 def handle_product_data(message):
@@ -183,7 +182,7 @@ def handle_product_data(message):
             }
         bot.send_message(message.chat.id, "Отправьте изображение товара")
     except:
-        bot.send_message(message.chat.id, "❌ Неверный формат данных!")
+        bot.send_message(message.chat.id, "❌ Неверный формат!")
         with state_lock:
             del user_states[message.chat.id]
 
@@ -197,12 +196,12 @@ def handle_product_image(message):
             "INSERT INTO products (telegram_id, barcode, name, price, image_id) VALUES (%s, %s, %s, %s, %s)",
             (message.chat.id, barcode, name, price, image_id)
         )
-        bot.send_message(message.chat.id, "✅ Товар успешно добавлен!", reply_markup=main_menu())
+        bot.send_message(message.chat.id, "✅ Товар добавлен!", reply_markup=main_menu())
     except psycopg2.IntegrityError:
-        bot.send_message(message.chat.id, "❌ Такой штрихкод уже существует!")
+        bot.send_message(message.chat.id, "❌ Штрихкод уже существует!")
     except Exception as e:
-        logger.error(f"Product add error: {e}")
-        bot.send_message(message.chat.id, "❌ Ошибка сохранения товара!")
+        logger.error(f"Ошибка: {e}")
+        bot.send_message(message.chat.id, "❌ Ошибка сохранения!")
     finally:
         with state_lock:
             del user_states[message.chat.id]
@@ -231,14 +230,14 @@ def delete_product(call):
         bot.delete_message(call.message.chat.id, call.message.message_id)
         bot.answer_callback_query(call.id, "✅ Товар удален")
     except Exception as e:
-        logger.error(f"Delete product error: {e}")
+        logger.error(f"Ошибка: {e}")
         bot.answer_callback_query(call.id, "❌ Ошибка удаления!")
 
 # Обработчики заявок
 @bot.message_handler(func=lambda m: m.text == "📝 Заявки")
 def handle_orders(message):
     markup = ReplyKeyboardMarkup(resize_keyboard=True)
-    markup.row("📝 Создать заявку", "📋 Мои заявки")
+    markup.row("📝 Новая заявка", "📋 Мои заявки")
     markup.row("🔙 Назад")
     bot.send_message(message.chat.id, "Управление заявками:", reply_markup=markup)
 
@@ -246,18 +245,18 @@ def handle_orders(message):
 def list_orders(message):
     orders = db.fetch("SELECT id, name, created_at FROM orders WHERE telegram_id = %s", (message.chat.id,))
     if not orders:
-        bot.send_message(message.chat.id, "📭 У вас нет активных заявок")
+        bot.send_message(message.chat.id, "📭 Нет активных заявок")
         return
     
     for order in orders:
         oid, name, date = order
         bot.send_message(
             message.chat.id,
-            f"📋 Заявка: {name}\n🕒 {date.strftime('%d.%m.%Y %H:%M')}",
+            f"📋 {name}\n🕒 {date.strftime('%d.%m.%Y %H:%M')}",
             reply_markup=order_markup(oid)
         )
 
-@bot.message_handler(func=lambda m: m.text == "📝 Создать заявку")
+@bot.message_handler(func=lambda m: m.text == "📝 Новая заявка")
 def create_order(message):
     with state_lock:
         user_states[message.chat.id] = {'step': 'create_order', 'time': time.time()}
@@ -268,7 +267,7 @@ def process_order_name(message):
     try:
         name = message.text.strip()
         if not name:
-            raise ValueError("Пустое название")
+            raise ValueError()
         
         order_id = db.fetch(
             "INSERT INTO orders (telegram_id, name) VALUES (%s, %s) RETURNING id",
@@ -277,7 +276,7 @@ def process_order_name(message):
         
         with state_lock:
             user_states[message.chat.id] = {
-                'step': 'order_management',
+                'step': 'order_manage',
                 'order_id': order_id,
                 'time': time.time()
             }
@@ -285,20 +284,20 @@ def process_order_name(message):
         markup = ReplyKeyboardMarkup(resize_keyboard=True)
         markup.row("📷 Сканировать штрихкод", "⌨ Ввести 4 цифры")
         markup.row("🔙 Завершить")
-        bot.send_message(message.chat.id, "Выберите способ добавления товаров:", reply_markup=markup)
+        bot.send_message(message.chat.id, "Выберите действие:", reply_markup=markup)
         
     except Exception as e:
-        logger.error(f"Order creation error: {e}")
-        bot.send_message(message.chat.id, "❌ Ошибка создания заявки!")
+        logger.error(f"Ошибка: {e}")
+        bot.send_message(message.chat.id, "❌ Ошибка создания!")
         with state_lock:
             del user_states[message.chat.id]
 
-@bot.message_handler(func=lambda m: user_states.get(m.chat.id, {}).get('step') == 'order_management')
+@bot.message_handler(func=lambda m: user_states.get(m.chat.id, {}).get('step') == 'order_manage')
 def handle_order_management(message):
     if message.text == "📷 Сканировать штрихкод":
         with state_lock:
             user_states[message.chat.id]['step'] = 'order_scan'
-        bot.send_message(message.chat.id, "Отправьте фото штрихкода товара")
+        bot.send_message(message.chat.id, "Отправьте фото штрихкода")
         
     elif message.text == "⌨ Ввести 4 цифры":
         with state_lock:
@@ -313,31 +312,29 @@ def handle_order_management(message):
 @bot.message_handler(func=lambda m: user_states.get(m.chat.id, {}).get('step') == 'order_input')
 def handle_order_input(message):
     try:
-        last_digits = message.text.strip()
-        if len(last_digits) != 4 or not last_digits.isdigit():
-            raise ValueError("Некорректный ввод")
+        digits = message.text.strip()
+        if len(digits) != 4 or not digits.isdigit():
+            raise ValueError()
         
         product = db.fetch(
             "SELECT id, price FROM products WHERE RIGHT(barcode, 4) = %s AND telegram_id = %s",
-            (last_digits, message.chat.id)
+            (digits, message.chat.id)
         )
         
-        if not product:
+        if product:
+            with state_lock:
+                user_states[message.chat.id].update({
+                    'step': 'add_qty',
+                    'product_id': product[0][0],
+                    'price': product[0][1]
+                })
+            bot.send_message(message.chat.id, "Введите количество и цену через пробел (по умолчанию 1 и цена из каталога):")
+        else:
             bot.send_message(message.chat.id, "❌ Товар не найден")
-            return
             
-        with state_lock:
-            user_states[message.chat.id].update({
-                'step': 'add_quantity',
-                'product_id': product[0][0],
-                'default_price': product[0][1]
-            })
-            
-        bot.send_message(message.chat.id, "Введите количество и цену через пробел (по умолчанию 1 и цена из каталога):")
-        
     except Exception as e:
-        logger.error(f"Order input error: {e}")
-        bot.send_message(message.chat.id, "❌ Ошибка ввода данных!")
+        logger.error(f"Ошибка: {e}")
+        bot.send_message(message.chat.id, "❌ Некорректный ввод!")
 
 @bot.message_handler(content_types=['photo'], func=lambda m: user_states.get(m.chat.id, {}).get('step') == 'order_scan')
 def handle_order_scan(message):
@@ -347,52 +344,50 @@ def handle_order_scan(message):
         
         barcode = process_barcode(image_data)
         if not barcode:
-            raise Exception("Штрихкод не найден")
+            raise Exception("Штрихкод не распознан")
             
         product = db.fetch(
             "SELECT id, price FROM products WHERE barcode = %s AND telegram_id = %s",
             (barcode, message.chat.id)
         )
         
-        if not product:
-            bot.send_message(message.chat.id, f"❌ Товар с кодом {barcode} не найден")
-            return
+        if product:
+            with state_lock:
+                user_states[message.chat.id].update({
+                    'step': 'add_qty',
+                    'product_id': product[0][0],
+                    'price': product[0][1]
+                })
+            bot.send_message(message.chat.id, "Введите количество и цену через пробел (по умолчанию 1 и цена из каталога):")
+        else:
+            bot.send_message(message.chat.id, f"❌ Товар {barcode} не найден")
             
-        with state_lock:
-            user_states[message.chat.id].update({
-                'step': 'add_quantity',
-                'product_id': product[0][0],
-                'default_price': product[0][1]
-            })
-            
-        bot.send_message(message.chat.id, "Введите количество и цену через пробел (по умолчанию 1 и цена из каталога):")
-        
     except Exception as e:
-        logger.error(f"Order scan error: {e}")
+        logger.error(f"Ошибка: {e}")
         bot.send_message(message.chat.id, f"❌ Ошибка: {str(e)}")
 
-@bot.message_handler(func=lambda m: user_states.get(m.chat.id, {}).get('step') == 'add_quantity')
-def handle_add_quantity(message):
+@bot.message_handler(func=lambda m: user_states.get(m.chat.id, {}).get('step') == 'add_qty')
+def handle_add_qty(message):
     try:
         parts = message.text.split()
-        quantity = int(parts[0]) if len(parts) > 0 else 1
-        price = float(parts[1]) if len(parts) > 1 else user_states[message.chat.id]['default_price']
-        
-        order_id = user_states[message.chat.id]['order_id']
-        product_id = user_states[message.chat.id]['product_id']
+        qty = int(parts[0]) if parts else 1
+        price = float(parts[1]) if len(parts) > 1 else user_states[message.chat.id]['price']
         
         db.execute(
             "INSERT INTO order_items (order_id, product_id, quantity, price) VALUES (%s, %s, %s, %s)",
-            (order_id, product_id, quantity, price)
+            (user_states[message.chat.id]['order_id'], 
+             user_states[message.chat.id]['product_id'],
+             qty,
+             price)
         )
         
-        bot.send_message(message.chat.id, "✅ Товар добавлен в заявку!")
+        bot.send_message(message.chat.id, "✅ Товар добавлен!")
         with state_lock:
-            user_states[message.chat.id]['step'] = 'order_management'
+            user_states[message.chat.id]['step'] = 'order_manage'
             
     except Exception as e:
-        logger.error(f"Add quantity error: {e}")
-        bot.send_message(message.chat.id, "❌ Ошибка добавления товара!")
+        logger.error(f"Ошибка: {e}")
+        bot.send_message(message.chat.id, "❌ Ошибка добавления!")
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith('delord_'))
 def delete_order(call):
@@ -402,7 +397,7 @@ def delete_order(call):
         bot.delete_message(call.message.chat.id, call.message.message_id)
         bot.answer_callback_query(call.id, "✅ Заявка удалена")
     except Exception as e:
-        logger.error(f"Delete order error: {e}")
+        logger.error(f"Ошибка: {e}")
         bot.answer_callback_query(call.id, "❌ Ошибка удаления!")
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith('export_'))
@@ -430,31 +425,8 @@ def export_order(call):
             
         os.remove(filename)
     except Exception as e:
-        logger.error(f"Export order error: {e}")
+        logger.error(f"Ошибка: {e}")
         bot.answer_callback_query(call.id, "❌ Ошибка экспорта!")
-
-@bot.message_handler(func=lambda m: m.text == "📤 Экспорт данных")
-def export_data(message):
-    try:
-        products = db.fetch("SELECT barcode, name, price FROM products WHERE telegram_id = %s", 
-                          (message.chat.id,))
-        
-        wb = Workbook()
-        ws = wb.active
-        ws.append(["Штрихкод", "Название", "Цена"])
-        for p in products:
-            ws.append(p)
-            
-        filename = f"catalog_{message.chat.id}.xlsx"
-        wb.save(filename)
-        
-        with open(filename, 'rb') as f:
-            bot.send_document(message.chat.id, f, caption="📤 Экспорт каталога")
-            
-        os.remove(filename)
-    except Exception as e:
-        logger.error(f"Export error: {e}")
-        bot.send_message(message.chat.id, "❌ Ошибка экспорта данных!")
 
 if __name__ == "__main__":
     Thread(target=app.run, kwargs={'host':'0.0.0.0','port':PORT}).start()
