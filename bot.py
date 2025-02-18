@@ -23,21 +23,16 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Инициализация бота
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-bot = telebot.TeleBot(TOKEN, num_threads=5)
-
-# Конфигурация
+bot = telebot.TeleBot(TOKEN)
 DB_URL = os.getenv("DATABASE_URL")
 OCR_API_KEY = os.getenv("OCR_API_KEY")
 MAX_IMAGE_SIZE_MB = 1
 user_states = {}
-CACHE_TIMEOUT = 300  # 5 минут
 
 def get_db_connection():
     return psycopg2.connect(DB_URL, sslmode="require")
 
-# Инициализация БД
 def init_db():
     commands = (
         """CREATE TABLE IF NOT EXISTS products (
@@ -60,23 +55,15 @@ def init_db():
             order_id INT NOT NULL REFERENCES orders(id) ON DELETE CASCADE,
             product_id INT NOT NULL REFERENCES products(id) ON DELETE CASCADE,
             quantity INT NOT NULL DEFAULT 1,
+            price FLOAT NOT NULL,
             created_at TIMESTAMP DEFAULT NOW()
         )"""
     )
-    
-    for _ in range(3):  # Повторные попытки
-        try:
-            with get_db_connection() as conn:
-                with conn.cursor() as cursor:
-                    for command in commands:
-                        cursor.execute(command)
-                conn.commit()
-            logger.info("Таблицы БД успешно созданы")
-            return
-        except Exception as e:
-            logger.error(f"Ошибка инициализации БД: {e}")
-            time.sleep(2)
-    raise Exception("Не удалось подключиться к БД")
+    with get_db_connection() as conn:
+        with conn.cursor() as cursor:
+            for command in commands:
+                cursor.execute(command)
+        conn.commit()
 
 init_db()
 
@@ -89,23 +76,18 @@ def home():
 def compress_image(image_data: bytes) -> bytes:
     if len(image_data) <= MAX_IMAGE_SIZE_MB * 1024 * 1024:
         return image_data
-    
     try:
         with Image.open(BytesIO(image_data)) as img:
             if img.mode != 'RGB':
                 img = img.convert('RGB')
-            
             output = BytesIO()
             quality = 85
-            
             while quality >= 50:
                 output.seek(0)
-                output.truncate(0)
                 img.save(output, format='JPEG', quality=quality, optimize=True)
                 if output.getbuffer().nbytes <= MAX_IMAGE_SIZE_MB * 1024 * 1024:
                     break
                 quality -= 5
-            
             return output.getvalue()
     except Exception as e:
         logger.error(f"Ошибка сжатия: {e}")
@@ -117,10 +99,9 @@ def preprocess_image(image_data: bytes) -> bytes:
         enhancer = ImageEnhance.Contrast(image)
         return enhancer.enhance(2.0).convert('L').tobytes()
     except Exception as e:
-        logger.error(f"Ошибка обработки изображения: {e}")
+        logger.error(f"Ошибка обработки: {e}")
         return image_data
 
-# Клавиатуры
 def main_menu():
     markup = ReplyKeyboardMarkup(resize_keyboard=True)
     markup.row("➕ Добавить товар")
@@ -141,310 +122,47 @@ def order_menu(order_id: int):
         InlineKeyboardButton("📤 Выгрузить", callback_data=f"export_order_{order_id}")
     )
 
-# Обработчики сообщений
 @bot.message_handler(commands=['start'])
 def handle_start(message):
-    try:
-        bot.send_message(message.chat.id, "🏪 Добро пожаловать!", reply_markup=main_menu())
-    except Exception as e:
-        logger.error(f"Ошибка в /start: {e}")
+    bot.send_message(message.chat.id, "🏪 Добро пожаловать!", reply_markup=main_menu())
 
-@bot.message_handler(func=lambda m: m.text == "➕ Добавить товар")
-def start_add_product(message):
-    user_states[message.chat.id] = {'step': 'await_product_data', 'time': time.time()}
-    bot.send_message(message.chat.id, "📝 Введите данные в формате:\nШтрихкод | Название | Цена")
-
-@bot.message_handler(func=lambda m: user_states.get(m.chat.id, {}).get('step') == 'await_product_data')
-def process_product_data(message):
-    try:
-        if time.time() - user_states[message.chat.id].get('time', 0) > CACHE_TIMEOUT:
-            del user_states[message.chat.id]
-            return
-
-        barcode, name, price = map(str.strip, message.text.split('|', 2))
-        user_states[message.chat.id] = {
-            'step': 'await_product_image',
-            'product_data': (barcode, name, float(price)),
-            'time': time.time()
-        }
-        bot.send_message(message.chat.id, "📷 Отправьте фото товара")
-    except:
-        bot.send_message(message.chat.id, "❌ Неверный формат!")
-        user_states.pop(message.chat.id, None)
-
-@bot.message_handler(content_types=['photo'], func=lambda m: user_states.get(m.chat.id, {}).get('step') == 'await_product_image')
-def process_product_image(message):
-    try:
-        if time.time() - user_states[message.chat.id].get('time', 0) > CACHE_TIMEOUT:
-            del user_states[message.chat.id]
-            return
-
-        barcode, name, price = user_states[message.chat.id]['product_data']
-        image_id = message.photo[-1].file_id
-        
-        with get_db_connection() as conn:
-            with conn.cursor() as cur:
-                cur.execute("""
-                    INSERT INTO products (telegram_id, barcode, name, price, image_id)
-                    VALUES (%s, %s, %s, %s, %s)
-                """, (message.chat.id, barcode, name, price, image_id))
-        bot.send_message(message.chat.id, "✅ Товар добавлен!", reply_markup=main_menu())
-    except psycopg2.errors.UniqueViolation:
-        bot.send_message(message.chat.id, "❌ Штрихкод уже существует!")
-    except Exception as e:
-        logger.error(f"Ошибка сохранения: {e}")
-        bot.send_message(message.chat.id, "❌ Ошибка сохранения!")
-    finally:
-        user_states.pop(message.chat.id, None)
-
-@bot.message_handler(func=lambda m: m.text == "📦 Каталог")
-def show_catalog(message):
+@bot.message_handler(func=lambda m: m.text == "📤 Экспорт")
+def export_catalog(message):
     try:
         with get_db_connection() as conn:
             with conn.cursor() as cur:
                 cur.execute("""
-                    SELECT id, barcode, name, price, image_id 
+                    SELECT barcode, name, price 
                     FROM products 
                     WHERE telegram_id = %s
                 """, (message.chat.id,))
                 products = cur.fetchall()
 
-        if not products:
-            bot.send_message(message.chat.id, "🛒 Каталог пуст")
-            return
-
-        for product in products:
-            product_id, barcode, name, price, image_id = product
-            caption = f"📦 {name}\n🔖 {barcode}\n💰 {price} руб."
-            if image_id:
-                bot.send_photo(message.chat.id, image_id, caption, reply_markup=catalog_menu(product_id))
-            else:
-                bot.send_message(message.chat.id, caption, reply_markup=catalog_menu(product_id))
-    except Exception as e:
-        logger.error(f"Ошибка каталога: {e}")
-        bot.send_message(message.chat.id, "❌ Ошибка загрузки")
-
-@bot.callback_query_handler(func=lambda call: call.data.startswith('edit_'))
-def handle_edit_product(call):
-    try:
-        product_id = call.data.split('_')[1]
-        user_states[call.message.chat.id] = {
-            'step': 'edit_product', 
-            'product_id': product_id,
-            'time': time.time()
-        }
-        bot.send_message(call.message.chat.id, "Введите новые данные:\nНазвание | Цена")
-    except Exception as e:
-        logger.error(f"Ошибка редактирования: {e}")
-        bot.answer_callback_query(call.id, "❌ Ошибка!")
-
-@bot.callback_query_handler(func=lambda call: call.data.startswith('delete_'))
-def handle_delete_product(call):
-    try:
-        product_id = call.data.split('_')[1]
-        with get_db_connection() as conn:
-            with conn.cursor() as cur:
-                cur.execute("DELETE FROM products WHERE id = %s", (product_id,))
-        bot.delete_message(call.message.chat.id, call.message.message_id)
-        bot.answer_callback_query(call.id, "✅ Товар удален")
-    except Exception as e:
-        logger.error(f"Ошибка удаления: {e}")
-        bot.answer_callback_query(call.id, "❌ Ошибка удаления!")
-
-@bot.message_handler(func=lambda m: user_states.get(m.chat.id, {}).get('step') == 'edit_product')
-def process_edit_product(message):
-    try:
-        if time.time() - user_states[message.chat.id].get('time', 0) > CACHE_TIMEOUT:
-            del user_states[message.chat.id]
-            return
-
-        product_id = user_states[message.chat.id]['product_id']
-        name, price = map(str.strip, message.text.split('|', 1))
-        
-        with get_db_connection() as conn:
-            with conn.cursor() as cur:
-                cur.execute("""
-                    UPDATE products 
-                    SET name = %s, price = %s 
-                    WHERE id = %s
-                """, (name, float(price), product_id))
-        
-        bot.send_message(message.chat.id, "✅ Товар обновлен!", reply_markup=main_menu())
-    except:
-        bot.send_message(message.chat.id, "❌ Неверный формат!")
-    finally:
-        user_states.pop(message.chat.id, None)
-
-@bot.message_handler(func=lambda m: m.text == "📝 Создать заявку")
-def create_order(message):
-    user_states[message.chat.id] = {'step': 'await_order_name', 'time': time.time()}
-    bot.send_message(message.chat.id, "📝 Введите название заявки:")
-
-@bot.message_handler(func=lambda m: user_states.get(m.chat.id, {}).get('step') == 'await_order_name')
-def process_order_name(message):
-    try:
-        if time.time() - user_states[message.chat.id].get('time', 0) > CACHE_TIMEOUT:
-            del user_states[message.chat.id]
-            return
-
-        order_name = message.text.strip()
-        if not order_name:
-            raise ValueError()
-        
-        with get_db_connection() as conn:
-            with conn.cursor() as cur:
-                cur.execute("""
-                    INSERT INTO orders (telegram_id, name)
-                    VALUES (%s, %s) RETURNING id
-                """, (message.chat.id, order_name))
-                order_id = cur.fetchone()[0]
-        
-        user_states[message.chat.id] = {
-            'step': 'order_manage', 
-            'order_id': order_id,
-            'time': time.time()
-        }
-        markup = ReplyKeyboardMarkup(resize_keyboard=True)
-        markup.add("🔍 Сканировать штрихкод", "⌨️ Ввести 4 цифры", "🔙 Назад")
-        bot.send_message(message.chat.id, "Выберите действие:", reply_markup=markup)
-    except:
-        bot.send_message(message.chat.id, "❌ Ошибка создания!")
-        user_states.pop(message.chat.id, None)
-
-@bot.message_handler(func=lambda m: user_states.get(m.chat.id, {}).get('step') == 'order_manage')
-def handle_order_action(message):
-    try:
-        if time.time() - user_states[message.chat.id].get('time', 0) > CACHE_TIMEOUT:
-            del user_states[message.chat.id]
-            return
-
-        if message.text == "🔍 Сканировать штрихкод":
-            user_states[message.chat.id]['step'] = 'await_barcode_scan'
-            bot.send_message(message.chat.id, "📷 Отправьте фото штрихкода")
-        elif message.text == "⌨️ Ввести 4 цифры":
-            user_states[message.chat.id]['step'] = 'await_barcode_input'
-            bot.send_message(message.chat.id, "Введите последние 4 цифры штрихкода:")
-        elif message.text == "🔙 Назад":
-            user_states.pop(message.chat.id, None)
-            bot.send_message(message.chat.id, "🔙 Главное меню", reply_markup=main_menu())
-    except Exception as e:
-        logger.error(f"Ошибка обработки заявки: {e}")
-
-@bot.message_handler(func=lambda m: user_states.get(m.chat.id, {}).get('step') == 'await_barcode_input')
-def process_barcode_input(message):
-    try:
-        if time.time() - user_states[message.chat.id].get('time', 0) > CACHE_TIMEOUT:
-            del user_states[message.chat.id]
-            return
-
-        last_digits = message.text.strip()
-        if len(last_digits) != 4 or not last_digits.isdigit():
-            raise ValueError()
-        
-        order_id = user_states[message.chat.id]['order_id']
-        with get_db_connection() as conn:
-            with conn.cursor() as cur:
-                cur.execute("""
-                    SELECT id FROM products 
-                    WHERE RIGHT(barcode, 4) = %s AND telegram_id = %s
-                """, (last_digits, message.chat.id))
-                product = cur.fetchone()
-                
-                if product:
-                    cur.execute("""
-                        INSERT INTO order_items (order_id, product_id)
-                        VALUES (%s, %s)
-                    """, (order_id, product[0]))
-                    bot.send_message(message.chat.id, "✅ Товар добавлен в заявку!")
-                else:
-                    bot.send_message(message.chat.id, "❌ Товар не найден")
-    except:
-        bot.send_message(message.chat.id, "❌ Неверный формат!")
-    finally:
-        user_states[message.chat.id]['step'] = 'order_manage'
-
-@bot.message_handler(func=lambda m: m.text == "📋 Список заявок")
-def list_orders(message):
-    try:
-        with get_db_connection() as conn:
-            with conn.cursor() as cur:
-                cur.execute("""
-                    SELECT id, name, created_at 
-                    FROM orders 
-                    WHERE telegram_id = %s
-                """, (message.chat.id,))
-                orders = cur.fetchall()
-
-        if not orders:
-            bot.send_message(message.chat.id, "📋 Нет активных заявок")
-            return
-
-        for order in orders:
-            order_id, name, created_at = order
-            bot.send_message(
-                message.chat.id,
-                f"📋 Заявка: {name}\n🕒 {created_at.strftime('%d.%m.%Y %H:%M')}",
-                reply_markup=order_menu(order_id)
-            )
-    except Exception as e:
-        logger.error(f"Ошибка списка заявок: {e}")
-        bot.send_message(message.chat.id, "❌ Ошибка загрузки")
-
-@bot.callback_query_handler(func=lambda call: call.data.startswith('edit_order_'))
-def edit_order(call):
-    try:
-        order_id = call.data.split('_')[2]
-        user_states[call.message.chat.id] = {
-            'step': 'edit_order', 
-            'order_id': order_id,
-            'time': time.time()
-        }
-        markup = ReplyKeyboardMarkup(resize_keyboard=True)
-        markup.add("📦 Список товаров", "➕ Добавить товар", "❌ Удалить товар")
-        markup.add("🔙 Назад")
-        bot.send_message(call.message.chat.id, "✏️ Редактирование заявки:", reply_markup=markup)
-    except Exception as e:
-        logger.error(f"Ошибка редактирования заявки: {e}")
-        bot.answer_callback_query(call.id, "❌ Ошибка!")
-
-@bot.callback_query_handler(func=lambda call: call.data.startswith('export_order_'))
-def export_order(call):
-    try:
-        order_id = call.data.split('_')[2]
-        with get_db_connection() as conn:
-            with conn.cursor() as cur:
-                cur.execute("""
-                    SELECT p.name, p.price, oi.quantity 
-                    FROM order_items oi
-                    JOIN products p ON oi.product_id = p.id
-                    WHERE oi.order_id = %s
-                """, (order_id,))
-                items = cur.fetchall()
-
         wb = Workbook()
         ws = wb.active
-        ws.append(["Название", "Цена", "Количество"])
-        for item in items:
-            ws.append(item)
+        ws.append(["Штрихкод", "Название", "Цена"])
+        for product in products:
+            ws.append(product)
         
-        filename = f"order_{order_id}.xlsx"
+        filename = f"catalog_{message.chat.id}.xlsx"
         wb.save(filename)
         
         with open(filename, 'rb') as f:
-            bot.send_document(call.message.chat.id, f, caption="📤 Экспорт заявки")
+            bot.send_document(message.chat.id, f, caption="📤 Экспорт каталога")
         
         os.remove(filename)
     except Exception as e:
         logger.error(f"Ошибка экспорта: {e}")
-        bot.answer_callback_query(call.id, "❌ Ошибка экспорта!")
+        bot.send_message(message.chat.id, "❌ Ошибка экспорта!")
 
-@bot.message_handler(content_types=['photo'], func=lambda m: user_states.get(m.chat.id, {}).get('step') == 'await_barcode_scan')
+@bot.message_handler(func=lambda m: m.text == "📷 Сканировать штрихкод")
+def handle_scan(message):
+    user_states[message.chat.id] = {'step': 'main_scan'}
+    bot.send_message(message.chat.id, "📷 Отправьте фото штрихкода")
+
+@bot.message_handler(content_types=['photo'], func=lambda m: user_states.get(m.chat.id, {}).get('step') in ['main_scan', 'order_scan'])
 def process_barcode_scan(message):
     try:
-        if time.time() - user_states[message.chat.id].get('time', 0) > CACHE_TIMEOUT:
-            del user_states[message.chat.id]
-            return
-
         file_info = bot.get_file(message.photo[-1].file_id)
         downloaded_file = bot.download_file(file_info.file_path)
         processed_image = preprocess_image(downloaded_file)
@@ -464,30 +182,141 @@ def process_barcode_scan(message):
         barcode = max(valid_barcodes, key=len) if valid_barcodes else None
 
         if barcode:
-            order_id = user_states[message.chat.id]['order_id']
-            with get_db_connection() as conn:
-                with conn.cursor() as cur:
-                    cur.execute("""
-                        SELECT id FROM products 
-                        WHERE barcode = %s AND telegram_id = %s
-                    """, (barcode, message.chat.id))
-                    product = cur.fetchone()
-                    
-                    if product:
+            if user_states[message.chat.id]['step'] == 'main_scan':
+                with get_db_connection() as conn:
+                    with conn.cursor() as cur:
                         cur.execute("""
-                            INSERT INTO order_items (order_id, product_id)
-                            VALUES (%s, %s)
-                        """, (order_id, product[0]))
-                        bot.send_message(message.chat.id, "✅ Товар добавлен в заявку!")
-                    else:
-                        bot.send_message(message.chat.id, f"❌ Товар с кодом {barcode} не найден")
+                            SELECT name, price FROM products 
+                            WHERE barcode = %s AND telegram_id = %s
+                        """, (barcode, message.chat.id))
+                        product = cur.fetchone()
+                        if product:
+                            response_text = f"✅ Штрихкод: {barcode}\n📦 {product[0]}\n💰 {product[1]} руб."
+                        else:
+                            response_text = f"❌ Товар не найден. Распознанный штрихкод: {barcode}"
+                bot.send_message(message.chat.id, response_text)
+                del user_states[message.chat.id]
+            
+            elif user_states[message.chat.id]['step'] == 'order_scan':
+                user_states[message.chat.id].update({
+                    'step': 'add_to_order',
+                    'barcode': barcode
+                })
+                bot.send_message(message.chat.id, "Введите количество и цену через пробел (по умолчанию 1 и цена из каталога):")
+        
         else:
-            bot.send_message(message.chat.id, "❌ Штрих-код не распознан")
+            bot.send_message(message.chat.id, "❌ Штрихкод не распознан")
+            del user_states[message.chat.id]
+
     except Exception as e:
         logger.error(f"Ошибка сканирования: {e}")
         bot.send_message(message.chat.id, "❌ Ошибка обработки изображения")
-    finally:
-        user_states[message.chat.id]['step'] = 'order_manage'
+        del user_states[message.chat.id]
+
+@bot.message_handler(func=lambda m: m.text == "📝 Создать заявку")
+def create_order(message):
+    user_states[message.chat.id] = {'step': 'create_order_name'}
+    bot.send_message(message.chat.id, "📝 Введите название заявки:")
+
+@bot.message_handler(func=lambda m: user_states.get(m.chat.id, {}).get('step') == 'create_order_name')
+def process_order_name(message):
+    try:
+        order_name = message.text.strip()
+        if not order_name:
+            raise ValueError()
+        
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO orders (telegram_id, name)
+                    VALUES (%s, %s) RETURNING id
+                """, (message.chat.id, order_name))
+                order_id = cur.fetchone()[0]
+        
+        user_states[message.chat.id] = {
+            'step': 'order_management',
+            'order_id': order_id
+        }
+        markup = ReplyKeyboardMarkup(resize_keyboard=True)
+        markup.add("🔍 Сканировать штрихкод", "⌨️ Ввести 4 цифры", "🔙 Завершить")
+        bot.send_message(message.chat.id, "Выберите действие:", reply_markup=markup)
+    except:
+        bot.send_message(message.chat.id, "❌ Ошибка создания!")
+        del user_states[message.chat.id]
+
+@bot.message_handler(func=lambda m: user_states.get(m.chat.id, {}).get('step') == 'order_management')
+def handle_order_action(message):
+    if message.text == "🔍 Сканировать штрихкод":
+        user_states[message.chat.id]['step'] = 'order_scan'
+        bot.send_message(message.chat.id, "📷 Отправьте фото штрихкода")
+    elif message.text == "⌨️ Ввести 4 цифры":
+        user_states[message.chat.id]['step'] = 'order_input'
+        bot.send_message(message.chat.id, "Введите последние 4 цифры штрихкода:")
+    elif message.text == "🔙 Завершить":
+        del user_states[message.chat.id]
+        bot.send_message(message.chat.id, "✅ Заявка сохранена", reply_markup=main_menu())
+
+@bot.message_handler(func=lambda m: user_states.get(m.chat.id, {}).get('step') == 'order_input')
+def process_order_input(message):
+    try:
+        last_digits = message.text.strip()
+        if len(last_digits) != 4 or not last_digits.isdigit():
+            raise ValueError()
+        
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT id, price FROM products 
+                    WHERE RIGHT(barcode, 4) = %s AND telegram_id = %s
+                """, (last_digits, message.chat.id))
+                product = cur.fetchone()
+                
+                if product:
+                    user_states[message.chat.id].update({
+                        'step': 'add_to_order',
+                        'product_id': product[0],
+                        'default_price': product[1]
+                    })
+                    bot.send_message(message.chat.id, "Введите количество и цену через пробел (по умолчанию 1 и цена из каталога):")
+                else:
+                    bot.send_message(message.chat.id, "❌ Товар не найден")
+    except:
+        bot.send_message(message.chat.id, "❌ Неверный формат!")
+
+@bot.message_handler(func=lambda m: user_states.get(m.chat.id, {}).get('step') == 'add_to_order')
+def process_add_to_order(message):
+    try:
+        parts = message.text.split()
+        quantity = int(parts[0]) if len(parts) > 0 else 1
+        price = float(parts[1]) if len(parts) > 1 else user_states[message.chat.id].get('default_price')
+        
+        order_id = user_states[message.chat.id]['order_id']
+        product_id = user_states[message.chat.id].get('product_id')
+        barcode = user_states[message.chat.id].get('barcode')
+
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                if barcode:
+                    cur.execute("""
+                        SELECT id, price FROM products 
+                        WHERE barcode = %s AND telegram_id = %s
+                    """, (barcode, message.chat.id))
+                    product = cur.fetchone()
+                    if not product:
+                        raise ValueError()
+                    product_id = product[0]
+                    price = price or product[1]
+
+                cur.execute("""
+                    INSERT INTO order_items (order_id, product_id, quantity, price)
+                    VALUES (%s, %s, %s, %s)
+                """, (order_id, product_id, quantity, price))
+        
+        bot.send_message(message.chat.id, "✅ Товар добавлен в заявку!")
+        user_states[message.chat.id]['step'] = 'order_management'
+    except Exception as e:
+        logger.error(f"Ошибка добавления: {e}")
+        bot.send_message(message.chat.id, "❌ Ошибка добавления товара")
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
